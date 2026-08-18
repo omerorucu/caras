@@ -6,7 +6,7 @@ QGIS 4.0 uyumlu versiyon - PyQt6 / QGIS 4.x API güncellemeleri uygulandı
 """
 
 from qgis.PyQt.QtCore import Qt
-from qgis.PyQt.QtGui import QFont
+from qgis.PyQt.QtGui import QFont, QIcon
 from qgis.PyQt.QtWidgets import (QAction, QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
     QSpinBox, QPushButton, QComboBox, QTextEdit, QGroupBox, QFileDialog, QMessageBox, 
     QProgressBar, QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox, QRadioButton,
@@ -332,23 +332,33 @@ class CARASDialog(QDialog):
         ref_label.setStyleSheet("font-weight: bold;")
         self.reference_combo = QComboBox()
         self.reference_combo.setMinimumWidth(400)
+        self.ref_browse_button = QPushButton("…")
+        self.ref_browse_button.setFixedWidth(32)
+        self.ref_browse_button.setToolTip("Klasörden raster dosyası seç / Browse raster file from folder")
+        self.ref_browse_button.clicked.connect(lambda: self.browse_raster_file(self.reference_combo))
         ref_layout.addWidget(ref_label)
         ref_layout.addWidget(self.reference_combo)
+        ref_layout.addWidget(self.ref_browse_button)
         ref_layout.addStretch()
         map_layout.addLayout(ref_layout)
-        
+
         ref_info = QLabel("↪ Gerçek arazi durumunu gösteren harita (ground truth)")
         ref_info.setStyleSheet("color: #7f8c8d; font-size: 10pt; margin-left: 20px;")
         map_layout.addWidget(ref_info)
-        
+
         class_layout = QHBoxLayout()
         class_label = QLabel("Sınıflandırılmış Harita / Classified Map:")
         class_label.setMinimumWidth(250)
         class_label.setStyleSheet("font-weight: bold;")
         self.classified_combo = QComboBox()
         self.classified_combo.setMinimumWidth(400)
+        class_browse_button = QPushButton("…")
+        class_browse_button.setFixedWidth(32)
+        class_browse_button.setToolTip("Klasörden raster dosyası seç / Browse raster file from folder")
+        class_browse_button.clicked.connect(lambda: self.browse_raster_file(self.classified_combo))
         class_layout.addWidget(class_label)
         class_layout.addWidget(self.classified_combo)
+        class_layout.addWidget(class_browse_button)
         class_layout.addStretch()
         map_layout.addLayout(class_layout)
         
@@ -501,6 +511,7 @@ class CARASDialog(QDialog):
         self.csv_widget.setVisible(is_csv)
         self.points_spin.setEnabled(not is_csv)
         self.reference_combo.setEnabled(not is_csv)
+        self.ref_browse_button.setEnabled(not is_csv)
         
     def browse_csv_file(self):
         """CSV dosyası seç"""
@@ -631,6 +642,36 @@ class CARASDialog(QDialog):
         
         for layer in raster_layers:
             combo.addItem(layer.name(), layer)
+
+    def browse_raster_file(self, combo):
+        """Klasörden raster dosyası seçip proje katmanlarına ve combo box'a ekler"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Raster Dosyası Seçin / Select Raster File",
+            "",
+            "Raster Files (*.tif *.tiff *.img *.asc *.vrt *.jp2 *.bil *.png);;All Files (*.*)"
+        )
+
+        if not file_path:
+            return
+
+        for i in range(combo.count()):
+            existing_layer = combo.itemData(i)
+            if existing_layer is not None and existing_layer.source() == file_path:
+                combo.setCurrentIndex(i)
+                return
+
+        layer_name = os.path.splitext(os.path.basename(file_path))[0]
+        layer = QgsRasterLayer(file_path, layer_name)
+
+        if not layer.isValid():
+            QMessageBox.critical(self, "Hata / Error",
+                f"Raster dosyası açılamadı / Could not open raster file:\n{file_path}")
+            return
+
+        QgsProject.instance().addMapLayer(layer)
+        combo.addItem(layer.name(), layer)
+        combo.setCurrentIndex(combo.count() - 1)
 
     def raster_to_array(self, layer):
         """Raster katmanının 1. bandını (height, width) numpy dizisine dönüştürür.
@@ -1507,7 +1548,8 @@ class CARASPlugin:
         
     def initGui(self):
         """Plugin GUI'sini başlat"""
-        self.action = QAction("CARAS — Accuracy & Regression Assessment", self.iface.mainWindow())
+        icon_path = os.path.join(os.path.dirname(__file__), "icon.png")
+        self.action = QAction(QIcon(icon_path), "CARAS — Accuracy & Regression Assessment", self.iface.mainWindow())
         self.action.setToolTip("CARAS — Classification Accuracy and Regression Assessment Suite")
         self.action.triggered.connect(self.run)
         self.iface.addPluginToMenu("&CARAS", self.action)
