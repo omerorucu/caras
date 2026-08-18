@@ -1,0 +1,90 @@
+# This file contains metadata for the QGIS plugin.
+# Required fields: name, description, version, qgisMinimumVersion, author, email, about, tracker, repository
+
+[general]
+
+# Plugin name (shown in Plugin Manager)
+name=CARAS - Classification Accuracy and Regression Assessment Suite
+
+# Short description (one line, shown in Plugin Manager list)
+description=Performs classification accuracy and regression assessment between two raster maps
+
+# Detailed description (shown in plugin details)
+about=	This plugin was developed with the assistance of DeepSeek AI and Claude AI (Anthropic).
+
+	CARAS (Classification Accuracy and Regression Assessment Suite) is a general-purpose
+    QGIS plugin for performing comprehensive validation analysis between two raster maps
+    (e.g. classified vs. reference). It supports multiple sampling methods (random,
+    stratified, systematic, CSV import), flexible class mapping, and computes a
+    comprehensive set of accuracy metrics including:
+    Overall Accuracy, Cohen's Kappa, F1-Score (macro & weighted), Precision, Recall,
+    Producer's & User's Accuracy per class, Confusion Matrix, R², RMSE, MAE, and Bias.
+    Results can be exported as TXT, JSON, or HTML reports. Compatible with QGIS 3.x and 4.0.
+
+    Desteklenen özellikler / Supported features:
+    - Rastgele, katmanlı ve sistematik örnekleme
+    - CSV dosyasından nokta yükleme
+    - Sınıf eşleştirme arayüzü
+    - Kapsamlı doğrulama metrikleri (OA, Kappa, F1, R², RMSE, MAE, Bias)
+    - TXT, JSON ve HTML rapor çıktısı
+    - Nokta katmanı olarak dışa aktarım (Shapefile)
+
+# Plugin version
+version=1.0.0
+
+# Minimum QGIS version required
+qgisMinimumVersion=3.0
+
+# Maximum QGIS version (leave empty for no upper limit)
+qgisMaximumVersion=4.99
+
+# Author name
+author=Ömer K. ÖRÜCÜ
+
+# Author email
+email=omerorucu@sdu.edu.tr
+
+# Plugin homepage URL
+homepage=https://github.com/omerorucu/caras
+
+# Bug tracker / issue URL
+tracker=https://github.com/omerorucu/caras/issues
+
+# Source code repository URL
+repository=https://github.com/omerorucu/caras
+
+# Tags for Plugin Manager search (comma-separated)
+tags=raster, accuracy assessment, validation, kappa, confusion matrix, classification, remote sensing, regression, RMSE, R2, MAE, bias, CARAS, doğrulama, uzaktan algılama
+
+# Category in Plugin Manager
+category=Raster
+
+# Icon file path (relative to plugin folder)
+icon=icon.png
+
+# Whether the plugin is experimental
+experimental=False
+
+# Whether the plugin is deprecated
+deprecated=False
+
+# Plugin changelog
+changelog=
+    1.0.0 - Initial release
+          - Random, stratified and systematic sampling
+          - CSV point import with reference values
+          - Class mapping dialog
+          - Metrics: OA, Kappa, F1, Precision, Recall, Confusion Matrix
+          - Regression statistics: R², RMSE, MAE, Bias (raw pixel & category values)
+          - Export to TXT, JSON, HTML and Shapefile
+          - QGIS 3.x and 4.0 / PyQt6 compatible (exec(), ItemFlag, AlignmentFlag,
+            ResizeMode, DialogCode, writeAsVectorFormatV3, QgsCoordinateTransformContext)
+          - Vectorized raster reading for large rasters, stratified sampling excludes NoData
+
+# Python dependencies (comma-separated)
+# These must be installed in the QGIS Python environment
+# install with: pip install scikit-learn numpy
+hasProcessingProvider=no
+
+# Server (set to True if the plugin provides a server interface)
+server=False
