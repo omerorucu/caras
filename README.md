@@ -1,49 +1,46 @@
 # CARAS — Classification Accuracy and Regression Assessment Suite
 
-CARAS, iki raster harita (ör. sınıflandırılmış vs. referans/ground truth) arasında kapsamlı doğrulama ve regresyon analizi yapan genel amaçlı bir QGIS eklentisidir.
-
 CARAS is a general-purpose QGIS plugin for performing comprehensive accuracy and regression assessment between two raster maps (e.g., a classified map vs. a reference/ground truth map).
 
-## Özellikler / Features
+## Features
 
-- **Örnekleme yöntemleri / Sampling methods**: Rastgele, katmanlı (stratified), sistematik veya önceden hazırlanmış CSV noktaları
-- **Klasörden raster seçimi**: Katman listesindeki rasterlerin yanı sıra "…" butonuyla doğrudan diskten raster dosyası açılabilir
-- **Sınıf eşleştirme arayüzü**: Referans ve sınıflandırılmış haritadaki piksel değerlerini karşılaştırılabilir kategorilere eşleme
-- **Doğrulama metrikleri**: Overall Accuracy, Cohen's Kappa, F1-Score (macro & weighted), Precision, Recall, Confusion Matrix, Producer's & User's Accuracy
-- **Regresyon istatistikleri**: R², RMSE, MAE, Bias (hem ham piksel hem kategori değerleri için)
-- **Rapor çıktıları**: TXT, JSON, HTML
-- **Nokta katmanı dışa aktarımı**: Shapefile
+- **Sampling methods**: random, stratified, systematic, or points imported from a CSV file
+- **Browse raster from disk**: in addition to layers already loaded in the project, the "…" button lets you open a raster file directly from folder
+- **Class mapping interface**: map pixel values from the reference and classified maps to comparable categories
+- **Accuracy metrics**: Overall Accuracy, Cohen's Kappa, F1-Score (macro & weighted), Precision, Recall, Confusion Matrix, Producer's & User's Accuracy
+- **Regression statistics**: R², RMSE, MAE, Bias (for both raw pixel values and mapped categories)
+- **Report export**: TXT, JSON, HTML
+- **Validation points export**: Shapefile
 
-## Gereksinimler / Requirements
+## Requirements
 
-- QGIS 3.x veya 4.0
-- Python paketleri: `numpy`, `scikit-learn` (QGIS'in kendi Python ortamına kurulmalı)
+- QGIS 3.x or 4.0
+- Python packages: `numpy`, `scikit-learn` (must be installed in QGIS's own Python environment)
 
 ```
 pip install numpy scikit-learn
 ```
 
-## Kurulum / Installation
+## Installation
 
-1. Bu depoyu indirin veya klonlayın
-2. `caras` klasörünü QGIS eklenti klasörüne kopyalayın:
-   - Windows: `%APPDATA%\QGIS\QGIS3\profiles\default\python\plugins\` (veya `QGIS4\...`)
+1. Download or clone this repository
+2. Copy the `caras` folder into your QGIS plugins directory:
+   - Windows: `%APPDATA%\QGIS\QGIS3\profiles\default\python\plugins\` (or `QGIS4\...`)
    - Linux/macOS: `~/.local/share/QGIS/QGIS3/profiles/default/python/plugins/`
-3. QGIS'i başlatın, **Eklentiler → Eklentileri Yönet ve Yükle** üzerinden CARAS'ı etkinleştirin
+3. Start QGIS and enable CARAS from **Plugins → Manage and Install Plugins**
 
-## Kullanım / Usage
+## Usage
 
-1. Araç çubuğundaki CARAS ikonuna tıklayın
-2. Referans ve sınıflandırılmış haritayı katman listesinden seçin ya da "…" ile diskten açın
-3. Örnekleme yöntemini ve nokta sayısını belirleyin (veya CSV dosyası seçin)
-4. **CARAS Analizi Başlat** ile analizi çalıştırın, açılan pencerede sınıf eşleştirmesini yapın
-5. Sonuçları inceleyin, isterseniz raporu (TXT/JSON/HTML) veya doğrulama noktalarını (Shapefile) kaydedin
+1. Click the CARAS icon in the toolbar
+2. Select the reference and classified map from the layer list, or open one from disk with "…"
+3. Choose a sampling method and number of points (or select a CSV file)
+4. Click **Run CARAS Analysis**, then complete the class mapping in the dialog that appears
+5. Review the results, and optionally export the report (TXT/JSON/HTML) or the validation points (Shapefile)
 
-CSV ile önceden belirlenmiş nokta kullanımı için bkz. [CSV_NOKTA_KULLANIMI.md](CSV_NOKTA_KULLANIMI.md).
+For using predefined points from a CSV file, see [CSV_NOKTA_KULLANIMI.md](CSV_NOKTA_KULLANIMI.md).
 
-## Lisans / License
+## License
 
-Yazar / Author: Ömer K. ÖRÜCÜ — omerorucu@sdu.edu.tr
+Author: Ömer K. ÖRÜCÜ — omerorucu@sdu.edu.tr
 
-Bu eklenti DeepSeek AI ve Claude AI (Anthropic) yardımıyla geliştirilmiştir.
 This plugin was developed with the assistance of DeepSeek AI and Claude AI (Anthropic).
