@@ -1,0 +1,83 @@
+cff-version: 1.2.0
+title: CARAS — Classification Accuracy and Regression Assessment Suite
+message: >-
+  If you use this software, please cite it and also cite Olofsson et al. (2014),
+  whose estimators, variance formulas and area adjustment CARAS implements.
+type: software
+authors:
+  - family-names: Örücü
+    given-names: Ömer Kamil
+    orcid: https://orcid.org/0000-0002-2162-7553
+    email: omerorucu@sdu.edu.tr
+    affiliation: >-
+      Department of Landscape Architecture, Faculty of Architecture,
+      Süleyman Demirel University, Isparta, Türkiye
+repository-code: https://github.com/omerorucu/caras
+license: GPL-3.0-or-later
+version: 2.0.0
+abstract: >-
+  CARAS is a QGIS plugin for design-based accuracy assessment, bias-adjusted
+  area estimation and continuous-map agreement analysis between two rasters.
+  It implements probability sampling designs (simple random, systematic with a
+  random start, stratified random with proportional, Neyman, equal or
+  rare-class-floor allocation), the stratified estimator and variance formulas
+  of Olofsson et al. (2014), confidence intervals for overall, user's and
+  producer's accuracy, F1 and class areas, bias-adjusted area estimation, and
+  the quantity / allocation / exchange / shift disagreement decomposition of
+  Pontius and colleagues. For continuous maps it reports RMSE with its
+  systematic and unsystematic components, MAE, bias, the coefficient of
+  determination reported separately from squared Pearson r, Willmott's indices,
+  Lin's concordance correlation and seeded bootstrap confidence intervals. All
+  runs are reproducible from a recorded seed, and every report carries the
+  complete analysis provenance.
+keywords:
+  - QGIS plugin
+  - accuracy assessment
+  - error matrix
+  - design-based inference
+  - stratified sampling
+  - area estimation
+  - land cover
+  - remote sensing
+  - quantity disagreement
+  - allocation disagreement
+  - map validation
+references:
+  - type: article
+    title: >-
+      Good practices for estimating area and assessing accuracy of land change
+    authors:
+      - family-names: Olofsson
+        given-names: Pontus
+      - family-names: Foody
+        given-names: Giles M.
+      - family-names: Herold
+        given-names: Martin
+      - family-names: Stehman
+        given-names: Stephen V.
+      - family-names: Woodcock
+        given-names: Curtis E.
+      - family-names: Wulder
+        given-names: Michael A.
+    journal: Remote Sensing of Environment
+    volume: 148
+    start: 42
+    end: 57
+    year: 2014
+    doi: 10.1016/j.rse.2014.02.015
+  - type: article
+    title: >-
+      Death to Kappa: birth of quantity disagreement and allocation
+      disagreement for accuracy assessment
+    authors:
+      - family-names: Pontius
+        given-names: Robert Gilmore
+      - family-names: Millones
+        given-names: Marco
+    journal: International Journal of Remote Sensing
+    volume: 32
+    issue: 15
+    start: 4407
+    end: 4429
+    year: 2011
+    doi: 10.1080/01431161.2011.552923

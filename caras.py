@@ -1,1578 +1,1546 @@
 # -*- coding: utf-8 -*-
 """
 CARAS - Classification Accuracy and Regression Assessment Suite
-İki raster harita arasında doğrulama analizi yapan genel amaçlı plugin
-QGIS 4.0 uyumlu versiyon - PyQt6 / QGIS 4.x API güncellemeleri uygulandı
+===============================================================
+
+QGIS user interface.  All statistics live in :mod:`caras.core`; this module
+only collects the analyst's choices, drives the run and renders the result.
+
+The interface is deliberately ordered as a four-step workflow, because the
+scientific content of the tool depends on the steps being taken in order:
+
+    1. Data      - pick the rasters, declare categorical or continuous, and
+                   read the pre-flight diagnostics before anything else.
+    2. Classes   - fold the raw pixel values of both rasters onto shared
+                   categories; the census behind this step also supplies the
+                   stratum weights.
+    3. Design    - choose a probability sampling design, a seed and, if
+                   stratified, an allocation; the sample-size planner says
+                   what precision the chosen n can deliver.
+    4. Results   - estimates with confidence intervals, adjusted areas,
+                   disagreement components, caveats, and exports.
+
+Copyright (C) 2026 Omer K. Orucu.  Licensed under the GNU General Public
+License version 3 or (at your option) any later version.
 """
 
-from qgis.PyQt.QtCore import Qt
-from qgis.PyQt.QtGui import QFont, QIcon
-from qgis.PyQt.QtWidgets import (QAction, QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
-    QSpinBox, QPushButton, QComboBox, QTextEdit, QGroupBox, QFileDialog, QMessageBox, 
-    QProgressBar, QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox, QRadioButton,
-    QButtonGroup, QWidget, QScrollArea, QLineEdit, QApplication)
-from qgis.core import (QgsProject, QgsVectorLayer, QgsRasterLayer, QgsField, 
-                       QgsFeature, QgsGeometry, QgsPointXY,
-                       QgsVectorFileWriter, QgsVectorFileWriterTask,
-                       QgsCoordinateTransformContext,
-                       QgsWkbTypes, QgsApplication)
-from qgis.utils import iface
-
-# QGIS 4.0 / PyQt6 uyumluluk: QVariant kaldırıldı, Python türleri kullanılır
-try:
-    from qgis.PyQt.QtCore import QVariant
-    _USE_QVARIANT = True
-except ImportError:
-    _USE_QVARIANT = False
-import numpy as np
-import random
-try:
-    from sklearn.metrics import (cohen_kappa_score, accuracy_score, confusion_matrix,
-        classification_report, f1_score, precision_score, recall_score,
-        mean_squared_error, mean_absolute_error, r2_score)
-except ImportError as e:
-    raise ImportError(
-        "CARAS eklentisi icin 'scikit-learn' kutuphanesi gereklidir.\n"
-        "CARAS plugin requires the 'scikit-learn' library.\n\n"
-        "Kurulum / Install (OSGeo4W Shell veya QGIS Python Console):\n"
-        "  pip install scikit-learn\n\n"
-        f"Orijinal hata / Original error: {e}"
-    ) from e
 import os
-import json
+import traceback
 from datetime import datetime
 
+from qgis.PyQt.QtCore import Qt
+from qgis.PyQt.QtGui import QColor, QIcon
+from qgis.PyQt.QtWidgets import (
+    QAction, QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog,
+    QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox,
+    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox, QProgressBar,
+    QPushButton, QRadioButton, QScrollArea, QSpinBox, QSplitter, QTabWidget,
+    QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget)
 
+from qgis.core import (QgsCoordinateReferenceSystem,
+                       QgsCoordinateTransformContext, QgsFeature, QgsField,
+                       QgsGeometry, QgsPointXY, QgsProject, QgsRasterLayer,
+                       QgsVectorFileWriter, QgsVectorLayer)
+
+import numpy as np
+
+from .core import analysis as ana
+from .core import estimators as est
+from .core import raster as rio
+from .core import report as rpt
+from .core.sampling import intersection_window
+
+PLUGIN_NAME = "CARAS"
+VERSION = ana.CARAS_VERSION
+
+_MONO = "Consolas, 'DejaVu Sans Mono', Menlo, monospace"
+
+
+# ---------------------------------------------------------------------------
+# Qt 5 / Qt 6 helpers
+# ---------------------------------------------------------------------------
+def _exec(dialog):
+    return dialog.exec() if hasattr(dialog, "exec") else dialog.exec_()
+
+
+def _make_field(name, kind):
+    """QgsField that works on QGIS 3 (QVariant) and QGIS 4 (QMetaType)."""
+    try:
+        from qgis.PyQt.QtCore import QVariant
+        mapping = {"int": QVariant.Int, "double": QVariant.Double,
+                   "string": QVariant.String}
+        return QgsField(name, mapping[kind])
+    except ImportError:
+        from qgis.PyQt.QtCore import QMetaType
+        mapping = {"int": QMetaType.Type.Int, "double": QMetaType.Type.Double,
+                   "string": QMetaType.Type.QString}
+        return QgsField(name, mapping[kind])
+
+
+def _stretch(header):
+    header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+
+
+def _bold(widget):
+    f = widget.font()
+    f.setBold(True)
+    widget.setFont(f)
+    return widget
+
+
+def _fmt_value(v):
+    f = float(v)
+    return str(int(f)) if f == int(f) else ("%g" % f)
+
+
+# ---------------------------------------------------------------------------
+# class mapping dialog
+# ---------------------------------------------------------------------------
 class ClassMappingDialog(QDialog):
-    """Sınıf eşleştirme için dialog"""
-    def __init__(self, reference_values, classified_values, parent=None):
-        super(ClassMappingDialog, self).__init__(parent)
-        self.setWindowTitle("CARAS - Sınıf Eşleştirme / Class Mapping")
-        self.setMinimumWidth(900)
-        self.setMinimumHeight(700)
-        
-        self.reference_unique = sorted(list(set(reference_values)))
-        self.classified_unique = sorted(list(set(classified_values)))
-        
-        self.setup_ui()
-        
-    def setup_ui(self):
-        layout = QVBoxLayout()
-        
-        # Başlık ve açıklama
-        title = QLabel("Sınıf Eşleştirme Ayarları")
-        title_font = QFont()
-        title_font.setPointSize(12)
-        title_font.setBold(True)
-        title.setFont(title_font)
+    """Fold the raw pixel values of both rasters onto shared categories.
+
+    The census counts are shown next to every value, because the decision that
+    matters - which raw values are worth keeping as separate categories - is
+    driven by how much of the map they cover.  Values left unassigned are
+    excluded from the target population, and the dialog says how much that is.
+    """
+
+    def __init__(self, ref_census, cls_census, parent=None,
+                 ref_name="Reference", cls_name="Classified"):
+        QDialog.__init__(self, parent)
+        self.setWindowTitle("CARAS - class mapping")
+        self.resize(1080, 720)
+        self.ref_values = list(ref_census["values"])
+        self.cls_values = list(cls_census["values"])
+        self.ref_counts = dict(ref_census["counts"])
+        self.cls_counts = dict(cls_census["counts"])
+        self.ref_total = max(1, sum(self.ref_counts.values()))
+        self.cls_total = max(1, sum(self.cls_counts.values()))
+        self.ref_name = ref_name
+        self.cls_name = cls_name
+        self.reference_mapping = None
+        self.classified_mapping = None
+        self.labels = None
+        self._build()
+        self.auto_map_identical()
+
+    # -- ui ---------------------------------------------------------------
+    def _build(self):
+        layout = QVBoxLayout(self)
+        title = QLabel("Assign the pixel values of both rasters to shared "
+                       "analysis categories")
+        title.setStyleSheet("font-size:14px;font-weight:600;")
         layout.addWidget(title)
-        
+
         info = QLabel(
-            "Her iki haritadaki sınıf değerlerini karşılaştırılabilir kategorilere atayın.\n"
-            "Aynı anlamı taşıyan sınıflar aynı kategori numarasına sahip olmalıdır.\n"
-            "Kategoriler: 1, 2, 3, 4, 5... şeklinde numaralandırılır."
-        )
+            "Values that mean the same thing must receive the same category "
+            "number. Set the category to 0 to exclude a value from the "
+            "analysis entirely - excluded pixels leave the target population, "
+            "and the report records how much of the map that was. Category "
+            "labels are taken from the reference raster where the two "
+            "disagree.")
         info.setWordWrap(True)
-        info.setStyleSheet("color: #555; padding: 10px; background: #f0f0f0; border-radius: 5px;")
+        info.setStyleSheet("color:#4a5a68;background:#f2f6f8;padding:9px;"
+                           "border-radius:4px;")
         layout.addWidget(info)
-        
-        # Scroll area için container
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll_widget = QWidget()
-        scroll_layout = QHBoxLayout()
-        
-        # Referans harita eşleştirme
-        reference_group = QGroupBox("Referans Haritası (Ground Truth)")
-        reference_layout = QVBoxLayout()
-        
-        ref_info = QLabel("Bu harita gerçeği temsil eden referans haritasıdır.")
-        ref_info.setStyleSheet("color: #2c3e50; font-style: italic;")
-        reference_layout.addWidget(ref_info)
-        
-        self.reference_table = QTableWidget()
-        self.reference_table.setColumnCount(3)
-        self.reference_table.setHorizontalHeaderLabels(["Piksel Değeri", "Sınıf Adı", "Kategori"])
-        self.reference_table.setRowCount(len(self.reference_unique))
-        
-        for i, val in enumerate(self.reference_unique):
-            if isinstance(val, float):
-                if val == int(val):
-                    display_val = str(int(val))
-                else:
-                    display_val = f"{val:.4f}"
-            else:
-                display_val = str(val)
-                
-            item = QTableWidgetItem(display_val)
+
+        split = QSplitter(Qt.Orientation.Horizontal)
+        self.ref_table = self._make_table(
+            "Reference raster - %s" % self.ref_name, self.ref_values,
+            self.ref_counts, self.ref_total, split)
+        self.cls_table = self._make_table(
+            "Classified raster - %s" % self.cls_name, self.cls_values,
+            self.cls_counts, self.cls_total, split)
+        layout.addWidget(split, 1)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Quick mapping:"))
+        b1 = QPushButton("Identical values share a category")
+        b1.setToolTip("Recommended when both rasters use the same legend.")
+        b1.clicked.connect(self.auto_map_identical)
+        b2 = QPushButton("Sequential (by rank)")
+        b2.setToolTip("Match the sorted value lists position by position; use "
+                      "only when the two legends are known to be ordered the "
+                      "same way.")
+        b2.clicked.connect(self.auto_map_sequential)
+        row.addWidget(b1)
+        row.addWidget(b2)
+        row.addStretch()
+        layout.addLayout(row)
+
+        self.summary = QLabel("")
+        self.summary.setWordWrap(True)
+        self.summary.setStyleSheet("color:#4a5a68;")
+        layout.addWidget(self.summary)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                                   | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self._accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _make_table(self, caption, values, counts, total, parent):
+        box = QGroupBox(caption, parent)
+        lay = QVBoxLayout(box)
+        table = QTableWidget(len(values), 5)
+        table.setHorizontalHeaderLabels(
+            ["Pixel value", "Pixels", "% of raster", "Label", "Category"])
+        for i, val in enumerate(values):
+            item = QTableWidgetItem(_fmt_value(val))
             item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            self.reference_table.setItem(i, 0, item)
-            
-            if isinstance(val, float):
-                if val == int(val):
-                    default_name = f"Sınıf_{int(val)}"
-                else:
-                    default_name = f"Sınıf_{val:.2f}"
-            else:
-                default_name = f"Sınıf_{val}"
-                
-            name_edit = QLineEdit(default_name)
-            self.reference_table.setCellWidget(i, 1, name_edit)
-            
-            category_spin = QSpinBox()
-            category_spin.setMinimum(1)
-            category_spin.setMaximum(100)
-            category_spin.setValue(i + 1)
-            self.reference_table.setCellWidget(i, 2, category_spin)
-            
-        self.reference_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        reference_layout.addWidget(self.reference_table)
-        reference_group.setLayout(reference_layout)
-        scroll_layout.addWidget(reference_group)
-        
-        # Sınıflandırılmış harita eşleştirme
-        classified_group = QGroupBox("Sınıflandırılmış Harita (Classification)")
-        classified_layout = QVBoxLayout()
-        
-        class_info = QLabel("Bu harita doğruluğu değerlendirilen sınıflandırılmış haritadır.")
-        class_info.setStyleSheet("color: #2c3e50; font-style: italic;")
-        classified_layout.addWidget(class_info)
-        
-        self.classified_table = QTableWidget()
-        self.classified_table.setColumnCount(3)
-        self.classified_table.setHorizontalHeaderLabels(["Piksel Değeri", "Sınıf Adı", "Kategori"])
-        self.classified_table.setRowCount(len(self.classified_unique))
-        
-        for i, val in enumerate(self.classified_unique):
-            if isinstance(val, float):
-                if val == int(val):
-                    display_val = str(int(val))
-                else:
-                    display_val = f"{val:.4f}"
-            else:
-                display_val = str(val)
-                
-            item = QTableWidgetItem(display_val)
-            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            self.classified_table.setItem(i, 0, item)
-            
-            if isinstance(val, float):
-                if val == int(val):
-                    default_name = f"Sınıf_{int(val)}"
-                else:
-                    default_name = f"Sınıf_{val:.2f}"
-            else:
-                default_name = f"Sınıf_{val}"
-                
-            name_edit = QLineEdit(default_name)
-            self.classified_table.setCellWidget(i, 1, name_edit)
-            
-            category_spin = QSpinBox()
-            category_spin.setMinimum(1)
-            category_spin.setMaximum(100)
-            category_spin.setValue(i + 1)
-            self.classified_table.setCellWidget(i, 2, category_spin)
-            
-        self.classified_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        classified_layout.addWidget(self.classified_table)
-        classified_group.setLayout(classified_layout)
-        scroll_layout.addWidget(classified_group)
-        
-        scroll_widget.setLayout(scroll_layout)
-        scroll.setWidget(scroll_widget)
-        layout.addWidget(scroll)
-        
-        # Hızlı eşleştirme butonları
-        quick_layout = QHBoxLayout()
-        quick_label = QLabel("Hızlı Eşleştirme:")
-        quick_layout.addWidget(quick_label)
-        
-        auto_button = QPushButton("Otomatik Eşleştir (Sıralı)")
-        auto_button.setToolTip("Her iki haritanın değerlerini küçükten büyüğe sıralayarak eşleştirir")
-        auto_button.clicked.connect(self.auto_map_sequential)
-        quick_layout.addWidget(auto_button)
-        
-        identical_button = QPushButton("Aynı Değerler (1:1)")
-        identical_button.setToolTip("Aynı piksel değerlerini aynı kategoriye atar")
-        identical_button.clicked.connect(self.auto_map_identical)
-        quick_layout.addWidget(identical_button)
-        
-        quick_layout.addStretch()
-        layout.addLayout(quick_layout)
-        
-        # Butonlar
-        button_layout = QHBoxLayout()
-        
-        ok_button = QPushButton("Tamam")
-        ok_button.setStyleSheet("QPushButton { background-color: #27ae60; color: white; font-weight: bold; padding: 8px; }")
-        ok_button.clicked.connect(self.accept)
-        button_layout.addWidget(ok_button)
-        
-        cancel_button = QPushButton("İptal")
-        cancel_button.setStyleSheet("QPushButton { background-color: #e74c3c; color: white; font-weight: bold; padding: 8px; }")
-        cancel_button.clicked.connect(self.reject)
-        button_layout.addWidget(cancel_button)
-        
-        layout.addLayout(button_layout)
-        self.setLayout(layout)
-        
-    def auto_map_sequential(self):
-        """Sıralı otomatik eşleştirme"""
-        for i in range(self.reference_table.rowCount()):
-            category_spin = self.reference_table.cellWidget(i, 2)
-            category_spin.setValue(i + 1)
-            
-        for i in range(self.classified_table.rowCount()):
-            category_spin = self.classified_table.cellWidget(i, 2)
-            category_spin.setValue(i + 1)
-            
+            table.setItem(i, 0, item)
+
+            cnt = int(counts.get(val, 0))
+            c_item = QTableWidgetItem("{:,}".format(cnt))
+            c_item.setFlags(c_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            c_item.setTextAlignment(Qt.AlignmentFlag.AlignRight
+                                    | Qt.AlignmentFlag.AlignVCenter)
+            table.setItem(i, 1, c_item)
+
+            share = 100.0 * cnt / total
+            p_item = QTableWidgetItem("%.3f" % share)
+            p_item.setFlags(p_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            p_item.setTextAlignment(Qt.AlignmentFlag.AlignRight
+                                    | Qt.AlignmentFlag.AlignVCenter)
+            if share < 0.5:
+                p_item.setForeground(QColor("#8a5a00"))
+                p_item.setToolTip("Rare class: a stratified design with a "
+                                  "floor of 20-50 units is usually needed to "
+                                  "estimate its accuracy at all.")
+            table.setItem(i, 2, p_item)
+
+            table.setCellWidget(i, 3, QLineEdit("Class %s" % _fmt_value(val)))
+            spin = QSpinBox()
+            spin.setRange(0, 999)
+            spin.setSpecialValueText("exclude")
+            spin.valueChanged.connect(self._refresh_summary)
+            table.setCellWidget(i, 4, spin)
+        _stretch(table.horizontalHeader())
+        lay.addWidget(table)
+        return table
+
+    # -- quick mappings ---------------------------------------------------
     def auto_map_identical(self):
-        """Aynı değerleri eşleştir"""
-        value_to_category = {}
-        category_counter = 1
-        
-        for i in range(self.reference_table.rowCount()):
-            val = self.reference_unique[i]
-            if val not in value_to_category:
-                value_to_category[val] = category_counter
-                category_counter += 1
-            category_spin = self.reference_table.cellWidget(i, 2)
-            category_spin.setValue(value_to_category[val])
-            
-        for i in range(self.classified_table.rowCount()):
-            val = self.classified_unique[i]
-            if val not in value_to_category:
-                value_to_category[val] = category_counter
-                category_counter += 1
-            category_spin = self.classified_table.cellWidget(i, 2)
-            category_spin.setValue(value_to_category[val])
-            
-    def get_mappings(self):
-        """Eşleştirme bilgilerini al"""
-        reference_mapping = {}
-        reference_names = {}
-        
-        for i in range(self.reference_table.rowCount()):
-            val = self.reference_unique[i]
-            name_edit = self.reference_table.cellWidget(i, 1)
-            category_spin = self.reference_table.cellWidget(i, 2)
-            
-            category = category_spin.value()
-            reference_mapping[val] = category
-            reference_names[category] = name_edit.text()
-            
-        classified_mapping = {}
-        classified_names = {}
-        
-        for i in range(self.classified_table.rowCount()):
-            val = self.classified_unique[i]
-            name_edit = self.classified_table.cellWidget(i, 1)
-            category_spin = self.classified_table.cellWidget(i, 2)
-            
-            category = category_spin.value()
-            classified_mapping[val] = category
-            if category not in classified_names:
-                classified_names[category] = name_edit.text()
-            
-        final_names = {}
-        all_categories = set(list(reference_names.keys()) + list(classified_names.keys()))
-        
-        for cat in all_categories:
-            if cat in reference_names:
-                final_names[cat] = reference_names[cat]
-            else:
-                final_names[cat] = classified_names[cat]
-        
-        return reference_mapping, classified_mapping, final_names
+        registry = {}
+        counter = [1]
 
+        def cat_for(v):
+            if v not in registry:
+                registry[v] = counter[0]
+                counter[0] += 1
+            return registry[v]
 
-class CARASDialog(QDialog):
-    """CARAS Ana dialog penceresi"""
-    def __init__(self, parent=None):
-        super(CARASDialog, self).__init__(parent)
-        self.setWindowTitle("CARAS - Classification Accuracy and Regression Assessment Suite")
-        self.setMinimumWidth(1000)
-        self.setMinimumHeight(800)
-        
-        self.sampled_points = None
-        self.validation_results = None
-        
-        self.setup_ui()
-        
-    def setup_ui(self):
-        """Arayüzü oluştur"""
-        main_layout = QVBoxLayout()
-        
-        # Başlık
-        title = QLabel("🌍 CARAS — Classification Accuracy and Regression Assessment Suite")
-        title_font = QFont()
-        title_font.setPointSize(13)
-        title_font.setBold(True)
-        title.setFont(title_font)
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        main_layout.addWidget(title)
-        
-        # Açıklama
-        description = QLabel(
-            "İki raster harita arasında kapsamlı doğrulama ve regresyon analizi yapar.\n"
-            "Performs comprehensive accuracy and regression assessment between two raster maps."
-        )
-        description.setWordWrap(True)
-        description.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        description.setStyleSheet("color: #555; padding: 10px;")
-        main_layout.addWidget(description)
-        
-        # Harita seçimi
-        map_group = QGroupBox("1. Harita Seçimi / Map Selection")
-        map_layout = QVBoxLayout()
-        
-        ref_layout = QHBoxLayout()
-        ref_label = QLabel("Referans Harita / Reference Map:")
-        ref_label.setMinimumWidth(250)
-        ref_label.setStyleSheet("font-weight: bold;")
-        self.reference_combo = QComboBox()
-        self.reference_combo.setMinimumWidth(400)
-        self.ref_browse_button = QPushButton("…")
-        self.ref_browse_button.setFixedWidth(32)
-        self.ref_browse_button.setToolTip("Klasörden raster dosyası seç / Browse raster file from folder")
-        self.ref_browse_button.clicked.connect(lambda: self.browse_raster_file(self.reference_combo))
-        ref_layout.addWidget(ref_label)
-        ref_layout.addWidget(self.reference_combo)
-        ref_layout.addWidget(self.ref_browse_button)
-        ref_layout.addStretch()
-        map_layout.addLayout(ref_layout)
+        for table, values in ((self.ref_table, self.ref_values),
+                              (self.cls_table, self.cls_values)):
+            for i, v in enumerate(values):
+                table.cellWidget(i, 4).setValue(cat_for(v))
+        self._refresh_summary()
 
-        ref_info = QLabel("↪ Gerçek arazi durumunu gösteren harita (ground truth)")
-        ref_info.setStyleSheet("color: #7f8c8d; font-size: 10pt; margin-left: 20px;")
-        map_layout.addWidget(ref_info)
+    def auto_map_sequential(self):
+        for table, values in ((self.ref_table, self.ref_values),
+                              (self.cls_table, self.cls_values)):
+            for i in range(len(values)):
+                table.cellWidget(i, 4).setValue(i + 1)
+        self._refresh_summary()
 
-        class_layout = QHBoxLayout()
-        class_label = QLabel("Sınıflandırılmış Harita / Classified Map:")
-        class_label.setMinimumWidth(250)
-        class_label.setStyleSheet("font-weight: bold;")
-        self.classified_combo = QComboBox()
-        self.classified_combo.setMinimumWidth(400)
-        class_browse_button = QPushButton("…")
-        class_browse_button.setFixedWidth(32)
-        class_browse_button.setToolTip("Klasörden raster dosyası seç / Browse raster file from folder")
-        class_browse_button.clicked.connect(lambda: self.browse_raster_file(self.classified_combo))
-        class_layout.addWidget(class_label)
-        class_layout.addWidget(self.classified_combo)
-        class_layout.addWidget(class_browse_button)
-        class_layout.addStretch()
-        map_layout.addLayout(class_layout)
-        
-        class_info = QLabel("↪ Doğruluğu değerlendirilecek sınıflandırılmış harita")
-        class_info.setStyleSheet("color: #7f8c8d; font-size: 10pt; margin-left: 20px;")
-        map_layout.addWidget(class_info)
-        
-        map_group.setLayout(map_layout)
-        main_layout.addWidget(map_group)
-        
-        # Örnekleme ayarları
-        sampling_group = QGroupBox("2. Örnekleme Ayarları / Sampling Settings")
-        sampling_layout = QVBoxLayout()
-        
-        method_layout = QHBoxLayout()
-        method_label = QLabel("Örnekleme Metodu / Method:")
-        method_label.setMinimumWidth(250)
-        self.method_group = QButtonGroup()
-        
-        self.random_radio = QRadioButton("Rastgele / Random")
-        self.random_radio.setChecked(True)
-        self.stratified_radio = QRadioButton("Katmanlı / Stratified")
-        self.systematic_radio = QRadioButton("Sistematik / Systematic")
-        self.csv_radio = QRadioButton("CSV Dosyası / CSV File")
-        
-        self.method_group.addButton(self.random_radio, 1)
-        self.method_group.addButton(self.stratified_radio, 2)
-        self.method_group.addButton(self.systematic_radio, 3)
-        self.method_group.addButton(self.csv_radio, 4)
-        
-        self.random_radio.toggled.connect(self.on_sampling_method_changed)
-        self.csv_radio.toggled.connect(self.on_sampling_method_changed)
-        
-        method_layout.addWidget(method_label)
-        method_layout.addWidget(self.random_radio)
-        method_layout.addWidget(self.stratified_radio)
-        method_layout.addWidget(self.systematic_radio)
-        method_layout.addWidget(self.csv_radio)
-        method_layout.addStretch()
-        sampling_layout.addLayout(method_layout)
-        
-        self.csv_widget = QWidget()
-        csv_layout = QHBoxLayout()
-        csv_layout.setContentsMargins(250, 0, 0, 0)
-        
-        csv_info = QLabel("CSV Formatı: id, x, y, reference_value")
-        csv_info.setStyleSheet("color: #7f8c8d; font-size: 9pt;")
-        csv_layout.addWidget(csv_info)
-        
-        self.csv_path_edit = QLineEdit()
-        self.csv_path_edit.setPlaceholderText("CSV dosya yolu / CSV file path...")
-        self.csv_path_edit.setMinimumWidth(300)
-        csv_layout.addWidget(self.csv_path_edit)
-        
-        csv_browse_button = QPushButton("📁 Gözat / Browse")
-        csv_browse_button.clicked.connect(self.browse_csv_file)
-        csv_layout.addWidget(csv_browse_button)
-        
-        csv_layout.addStretch()
-        self.csv_widget.setLayout(csv_layout)
-        self.csv_widget.setVisible(False)
-        sampling_layout.addWidget(self.csv_widget)
-        
-        points_layout = QHBoxLayout()
-        points_label = QLabel("Nokta Sayısı / Number of Points:")
-        points_label.setMinimumWidth(250)
-        self.points_spin = QSpinBox()
-        self.points_spin.setMinimum(30)
-        self.points_spin.setMaximum(100000)
-        self.points_spin.setValue(500)
-        self.points_spin.setSingleStep(50)
-        points_layout.addWidget(points_label)
-        points_layout.addWidget(self.points_spin)
-        points_layout.addStretch()
-        sampling_layout.addLayout(points_layout)
-        
-        sampling_group.setLayout(sampling_layout)
-        main_layout.addWidget(sampling_group)
-        
-        # Çalıştır butonu
-        button_layout = QHBoxLayout()
-        
-        self.validate_button = QPushButton("🔍 CARAS Analizi Başlat / Run CARAS Analysis")
-        self.validate_button.setStyleSheet("""
-            QPushButton {
-                background-color: #3498db;
-                color: white;
-                font-weight: bold;
-                padding: 12px;
-                border-radius: 6px;
-                font-size: 12pt;
-            }
-            QPushButton:hover {
-                background-color: #2980b9;
-            }
-        """)
-        self.validate_button.clicked.connect(self.run_validation)
-        button_layout.addWidget(self.validate_button)
-        
-        main_layout.addLayout(button_layout)
-        
-        # İlerleme çubuğu
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setVisible(False)
-        main_layout.addWidget(self.progress_bar)
-        
-        # Sonuç alanı
-        results_group = QGroupBox("3. Sonuçlar / Results")
-        results_layout = QVBoxLayout()
-        
-        self.result_text = QTextEdit()
-        self.result_text.setReadOnly(True)
-        self.result_text.setMinimumHeight(300)
-        self.result_text.setStyleSheet("""
-            QTextEdit {
-                font-family: 'Courier New', monospace;
-                font-size: 10pt;
-                background-color: #2c3e50;
-                color: #ecf0f1;
-                border: 2px solid #34495e;
-                border-radius: 5px;
-                padding: 10px;
-            }
-        """)
-        results_layout.addWidget(self.result_text)
-        
-        action_layout = QHBoxLayout()
-        
-        self.export_button = QPushButton("💾 Raporu Kaydet / Save Report")
-        self.export_button.setEnabled(False)
-        self.export_button.clicked.connect(self.export_results)
-        action_layout.addWidget(self.export_button)
-        
-        self.save_points_button = QPushButton("📍 Noktaları Kaydet / Save Points")
-        self.save_points_button.setEnabled(False)
-        self.save_points_button.clicked.connect(self.save_validation_points)
-        action_layout.addWidget(self.save_points_button)
-        
-        action_layout.addStretch()
-        results_layout.addLayout(action_layout)
-        
-        results_group.setLayout(results_layout)
-        main_layout.addWidget(results_group)
-        
-        self.setLayout(main_layout)
-        
-    def on_sampling_method_changed(self):
-        """Örnekleme metoduna göre UI'yi ayarla"""
-        is_csv = self.csv_radio.isChecked()
-        self.csv_widget.setVisible(is_csv)
-        self.points_spin.setEnabled(not is_csv)
-        self.reference_combo.setEnabled(not is_csv)
-        self.ref_browse_button.setEnabled(not is_csv)
-        
-    def browse_csv_file(self):
-        """CSV dosyası seç"""
-        file_path, _ = QFileDialog.getOpenFileName(
-            self, 
-            "CSV Dosyası Seçin / Select CSV File", 
-            "", 
-            "CSV Files (*.csv);;All Files (*.*)"
-        )
-        
-        if file_path:
-            self.csv_path_edit.setText(file_path)
-            
-            try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    first_line = f.readline().strip()
-                    second_line = f.readline().strip()
-                    
-                    headers = [h.strip().lower() for h in first_line.split(',')]
-                    required = ['id', 'x', 'y', 'reference_value']
-                    
-                    if not all(req in headers for req in required):
-                        QMessageBox.warning(self, "Uyarı / Warning",
-                            f"CSV dosyası gerekli sütunları içermiyor!\n"
-                            f"CSV file doesn't contain required columns!\n\n"
-                            f"Gerekli / Required: id, x, y, reference_value\n"
-                            f"Bulunan / Found: {', '.join(headers)}")
-                        self.csv_path_edit.clear()
-                        return
-                    
-                    if second_line:
-                        test_data = second_line.split(',')
-                        if len(test_data) < 4:
-                            QMessageBox.warning(self, "Uyarı / Warning",
-                                "CSV formatı hatalı! / Invalid CSV format!\n"
-                                "Her satır en az 4 sütun içermelidir / Each row must have at least 4 columns")
-                            self.csv_path_edit.clear()
-                            return
-                            
-                QMessageBox.information(self, "Başarılı / Success",
-                    "✓ CSV dosyası başarıyla yüklendi!\n"
-                    "✓ CSV file loaded successfully!")
-                    
-            except Exception as e:
-                QMessageBox.critical(self, "Hata / Error",
-                    f"CSV dosyası okunamadı / Cannot read CSV file:\n{str(e)}")
-                self.csv_path_edit.clear()
-    
-    def load_points_from_csv(self, csv_path, raster_layer):
-        """CSV dosyasından noktaları yükle (raster_layer: koordinat/piksel dönüşümü
-        için kullanılan sınıflandırılmış harita, referans değerler ise CSV'den gelir)"""
-        from qgis.core import QgsCoordinateReferenceSystem, QgsCoordinateTransform
+    # -- result -----------------------------------------------------------
+    def _collect(self, table, values, counts, total):
+        mapping, labels, excluded = {}, {}, 0
+        for i, v in enumerate(values):
+            cat = table.cellWidget(i, 4).value()
+            if cat == 0:
+                excluded += int(counts.get(v, 0))
+                continue
+            mapping[v] = cat
+            text = table.cellWidget(i, 3).text().strip()
+            if cat not in labels and text:
+                labels[cat] = text
+        return mapping, labels, 100.0 * excluded / total
 
-        points = []
-        reference_values_from_csv = []
-        point_ids = []
-
+    def _refresh_summary(self):
         try:
-            with open(csv_path, 'r', encoding='utf-8') as f:
-                header = f.readline().strip().split(',')
-                headers = [h.strip().lower() for h in header]
-
-                id_idx = headers.index('id')
-                x_idx = headers.index('x')
-                y_idx = headers.index('y')
-                ref_val_idx = headers.index('reference_value')
-
-                wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
-                layer_crs = raster_layer.crs()
-
-                needs_transform = (wgs84.authid() != layer_crs.authid())
-                if needs_transform:
-                    transform = QgsCoordinateTransform(wgs84, layer_crs, QgsProject.instance())
-
-                ref_extent = raster_layer.extent()
-
-                for line_num, line in enumerate(f, start=2):
-                    line = line.strip()
-                    if not line:
-                        continue
-
-                    parts = line.split(',')
-                    if len(parts) < 4:
-                        continue
-
-                    try:
-                        point_id = parts[id_idx].strip()
-                        x = float(parts[x_idx].strip())
-                        y = float(parts[y_idx].strip())
-
-                        ref_val_str = parts[ref_val_idx].strip()
-                        ref_val = float(ref_val_str)
-
-                        point_geom = QgsPointXY(x, y)
-
-                        if needs_transform:
-                            point_geom = transform.transform(point_geom)
-
-                        pixel_x = int((point_geom.x() - ref_extent.xMinimum()) / raster_layer.rasterUnitsPerPixelX())
-                        pixel_y = int((ref_extent.yMaximum() - point_geom.y()) / raster_layer.rasterUnitsPerPixelY())
-
-                        if 0 <= pixel_x < raster_layer.width() and 0 <= pixel_y < raster_layer.height():
-                            points.append({
-                                'x': pixel_x,
-                                'y': pixel_y,
-                                'coord_x': point_geom.x(),
-                                'coord_y': point_geom.y(),
-                                'id': point_id,
-                                'ref_value': ref_val
-                            })
-                            reference_values_from_csv.append(ref_val)
-                            point_ids.append(point_id)
-                        
-                    except (ValueError, IndexError) as e:
-                        self.result_text.append(f"   ⚠ Satır {line_num} atlandı / Line {line_num} skipped: {str(e)}\n")
-                        continue
-                
-                return points, reference_values_from_csv, point_ids
-                
-        except Exception as e:
-            raise Exception(f"CSV dosyası yüklenirken hata / Error loading CSV: {str(e)}")
-        
-    def load_raster_layers(self, combo):
-        """Raster katmanlarını yükle"""
-        combo.clear()
-        layers = QgsProject.instance().mapLayers().values()
-        raster_layers = [layer for layer in layers if isinstance(layer, QgsRasterLayer)]
-        
-        for layer in raster_layers:
-            combo.addItem(layer.name(), layer)
-
-    def browse_raster_file(self, combo):
-        """Klasörden raster dosyası seçip proje katmanlarına ve combo box'a ekler"""
-        file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Raster Dosyası Seçin / Select Raster File",
-            "",
-            "Raster Files (*.tif *.tiff *.img *.asc *.vrt *.jp2 *.bil *.png);;All Files (*.*)"
-        )
-
-        if not file_path:
+            rm, _rl, rex = self._collect(self.ref_table, self.ref_values,
+                                         self.ref_counts, self.ref_total)
+            cm, _cl, cex = self._collect(self.cls_table, self.cls_values,
+                                         self.cls_counts, self.cls_total)
+        except Exception:
             return
+        cats = sorted(set(list(rm.values()) + list(cm.values())))
+        missing = [c for c in cats
+                   if c not in set(rm.values()) or c not in set(cm.values())]
+        msg = ("%d categories defined. Excluded from the population: %.3f %% "
+               "of the reference raster, %.3f %% of the classified raster."
+               % (len(cats), rex, cex))
+        if missing:
+            msg += ("  Categories missing from one raster: %s. That is legal - "
+                    "their row or column of the matrix will simply be empty."
+                    % ", ".join(str(c) for c in missing))
+        self.summary.setText(msg)
 
+    def _accept(self):
+        rm, rl, _rex = self._collect(self.ref_table, self.ref_values,
+                                     self.ref_counts, self.ref_total)
+        cm, cl, _cex = self._collect(self.cls_table, self.cls_values,
+                                     self.cls_counts, self.cls_total)
+        if not rm or not cm:
+            QMessageBox.warning(self, PLUGIN_NAME,
+                                "At least one category must remain in each "
+                                "raster.")
+            return
+        labels = {}
+        for cat in sorted(set(list(rm.values()) + list(cm.values()))):
+            labels[cat] = rl.get(cat) or cl.get(cat) or ("Category %d" % cat)
+        seen = {}
+        for cat in sorted(labels):
+            name = labels[cat]
+            if name in seen:
+                QMessageBox.warning(
+                    self, PLUGIN_NAME,
+                    "Categories %d and %d share the label '%s'. Distinct "
+                    "labels are required so that per-class results cannot be "
+                    "confused." % (seen[name], cat, name))
+                return
+            seen[name] = cat
+        self.reference_mapping = ana.ClassMapping(rm, rl)
+        self.classified_mapping = ana.ClassMapping(cm, cl)
+        self.labels = labels
+        self.accept()
+
+
+# ---------------------------------------------------------------------------
+# sample size planner
+# ---------------------------------------------------------------------------
+class SampleSizeDialog(QDialog):
+    """Olofsson et al. (2014) Eq. 13, exposed as an interactive planner."""
+
+    def __init__(self, weights, labels, parent=None):
+        QDialog.__init__(self, parent)
+        self.setWindowTitle("CARAS - sample size planner")
+        self.resize(700, 540)
+        self.weights = np.asarray(weights, dtype=float)
+        self.labels = list(labels)
+        self.chosen = None
+        self.n = 0
+        self._build()
+        self._recompute()
+
+    def _build(self):
+        lay = QVBoxLayout(self)
+        note = QLabel(
+            "The total sample size follows from the precision you want on "
+            "overall accuracy: n = (sum_i W_i S_i / S(O))^2 with "
+            "S_i = sqrt(U_i (1 - U_i)) (Olofsson et al. 2014, Eq. 13). Enter "
+            "the user's accuracy you expect for each class; 0.5 is the safe, "
+            "maximum-variance guess.")
+        note.setWordWrap(True)
+        note.setStyleSheet("color:#4a5a68;background:#f2f6f8;padding:9px;"
+                           "border-radius:4px;")
+        lay.addWidget(note)
+
+        form = QFormLayout()
+        self.target = QDoubleSpinBox()
+        self.target.setRange(0.1, 25.0)
+        self.target.setValue(2.0)
+        self.target.setSuffix(" percentage points")
+        self.target.setDecimals(1)
+        self.target.setSingleStep(0.5)
+        self.target.valueChanged.connect(self._recompute)
+        form.addRow("Target margin of error (95 %) on overall accuracy:",
+                    self.target)
+        lay.addLayout(form)
+
+        self.table = QTableWidget(len(self.labels), 3)
+        self.table.setHorizontalHeaderLabels(
+            ["Class", "Area share W", "Expected user's accuracy"])
+        for i, lab in enumerate(self.labels):
+            item = QTableWidgetItem(str(lab))
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.table.setItem(i, 0, item)
+            w = QTableWidgetItem("%.6f" % self.weights[i])
+            w.setFlags(w.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.table.setItem(i, 1, w)
+            spin = QDoubleSpinBox()
+            spin.setRange(0.05, 0.999)
+            spin.setDecimals(2)
+            spin.setSingleStep(0.05)
+            spin.setValue(0.80)
+            spin.valueChanged.connect(self._recompute)
+            self.table.setCellWidget(i, 2, spin)
+        _stretch(self.table.horizontalHeader())
+        lay.addWidget(self.table, 1)
+
+        self.result = QLabel("")
+        self.result.setWordWrap(True)
+        self.result.setStyleSheet("font-size:13px;padding:8px;"
+                                  "background:#eef4f7;border-radius:4px;")
+        lay.addWidget(self.result)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                                   | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText(
+            "Use this sample size")
+        buttons.accepted.connect(self._accept)
+        buttons.rejected.connect(self.reject)
+        lay.addWidget(buttons)
+
+    def _expected(self):
+        return [self.table.cellWidget(i, 2).value()
+                for i in range(len(self.labels))]
+
+    def _recompute(self):
+        se = (self.target.value() / 100.0) / est.Z_95
+        try:
+            n = est.sample_size_olofsson(self.weights, se, self._expected())
+            alloc_p = est.allocate_sample(self.weights, n, "proportional")
+            alloc_n = est.allocate_sample(self.weights, n, "neyman",
+                                          expected_ua=self._expected())
+        except Exception as exc:
+            self.result.setText(str(exc))
+            return
+        self.n = n
+        thin = [self.labels[i] for i in range(len(self.labels))
+                if alloc_p[i] < 20]
+        text = ("<b>%d validation units</b> are needed for a +/- %.1f point "
+                "margin of error on overall accuracy.<br>Proportional "
+                "allocation: %s<br>Neyman allocation: %s"
+                % (n, self.target.value(),
+                   ", ".join("%s=%d" % (self.labels[i], alloc_p[i])
+                             for i in range(len(self.labels))),
+                   ", ".join("%s=%d" % (self.labels[i], alloc_n[i])
+                             for i in range(len(self.labels)))))
+        if thin:
+            text += ("<br><span style='color:#8a5a00'>Proportional allocation "
+                     "leaves fewer than 20 units in: %s. Raise the per-stratum "
+                     "floor if the accuracy of those classes matters.</span>"
+                     % ", ".join(str(t) for t in thin))
+        self.result.setText(text)
+
+    def _accept(self):
+        self.chosen = self.n
+        self.accept()
+
+
+# ---------------------------------------------------------------------------
+# main dialog
+# ---------------------------------------------------------------------------
+class CARASDialog(QDialog):
+
+    def __init__(self, iface, parent=None):
+        QDialog.__init__(self, parent)
+        self.iface = iface
+        self.setWindowTitle("%s %s - Classification Accuracy and Regression "
+                            "Assessment Suite" % (PLUGIN_NAME, VERSION))
+        self.resize(1180, 860)
+
+        self.ref_info = None
+        self.cls_info = None
+        self.ref_census = None
+        self.cls_census = None
+        self.reference_mapping = None
+        self.classified_mapping = None
+        self.category_labels = None
+        self.result = None
+        self._export_buttons = []
+
+        self._build()
+        self.reload_layers()
+
+    # -- construction -----------------------------------------------------
+    def _build(self):
+        root = QVBoxLayout(self)
+
+        header = QLabel("CARAS %s - design-based accuracy, area and agreement "
+                        "assessment" % VERSION)
+        header.setStyleSheet("font-size:16px;font-weight:600;color:#1f6f8b;")
+        root.addWidget(header)
+
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self._tab_data(), "1. Data")
+        self.tabs.addTab(self._tab_classes(), "2. Classes")
+        self.tabs.addTab(self._tab_design(), "3. Design")
+        self.tabs.addTab(self._tab_results(), "4. Results")
+        for i in (1, 2, 3):
+            self.tabs.setTabEnabled(i, False)
+        root.addWidget(self.tabs, 1)
+
+        bar = QHBoxLayout()
+        self.status = QLabel("")
+        self.status.setStyleSheet("color:#4a5a68;")
+        self.progress = QProgressBar()
+        self.progress.setVisible(False)
+        bar.addWidget(self.status, 1)
+        bar.addWidget(self.progress, 2)
+
+        self.run_button = QPushButton("Run analysis")
+        self.run_button.setEnabled(False)
+        self.run_button.setStyleSheet(
+            "QPushButton{background:#1f6f8b;color:white;font-weight:600;"
+            "padding:7px 18px;border-radius:3px;}"
+            "QPushButton:disabled{background:#adbcc6;}")
+        self.run_button.clicked.connect(self.run_analysis)
+        bar.addWidget(self.run_button)
+
+        close = QPushButton("Close")
+        close.clicked.connect(self.reject)
+        bar.addWidget(close)
+        root.addLayout(bar)
+
+    # -- tab 1 ------------------------------------------------------------
+    def _tab_data(self):
+        w = QWidget()
+        lay = QVBoxLayout(w)
+
+        mode_box = QGroupBox("Measurement scale of the data")
+        ml = QVBoxLayout(mode_box)
+        self.mode_categorical = QRadioButton(
+            "Categorical (thematic classes) - accuracy, adjusted area and "
+            "disagreement")
+        self.mode_categorical.setChecked(True)
+        self.mode_continuous = QRadioButton(
+            "Continuous (biomass, cover, LST, model output) - RMSE, bias, "
+            "agreement")
+        for b in (self.mode_categorical, self.mode_continuous):
+            b.toggled.connect(self._mode_changed)
+            ml.addWidget(b)
+        note = QLabel(
+            "This choice is enforced. RMSE, R-squared and bias computed on "
+            "nominal class codes depend entirely on the arbitrary integers "
+            "used as labels, so CARAS refuses to report them for categorical "
+            "data - a defect of version 1 that this release removes.")
+        note.setWordWrap(True)
+        note.setStyleSheet("color:#8a5a00;")
+        ml.addWidget(note)
+        lay.addWidget(mode_box)
+
+        maps = QGroupBox("Rasters")
+        form = QFormLayout(maps)
+        self.ref_combo, ref_row, self.ref_band = self._layer_row()
+        self.cls_combo, cls_row, self.cls_band = self._layer_row()
+        form.addRow("Reference map (ground truth):", ref_row)
+        form.addRow("Classified map (being assessed):", cls_row)
+        refresh = QPushButton("Reload layer list")
+        refresh.clicked.connect(self.reload_layers)
+        inspect = QPushButton("Inspect rasters and continue")
+        inspect.setStyleSheet("font-weight:600;padding:5px 14px;")
+        inspect.clicked.connect(self.inspect_rasters)
+        row = QHBoxLayout()
+        row.addWidget(refresh)
+        row.addStretch()
+        row.addWidget(inspect)
+        form.addRow("", self._wrap(row))
+        lay.addWidget(maps)
+
+        diag = QGroupBox("Pre-flight diagnostics")
+        dl = QVBoxLayout(diag)
+        self.diag_text = QTextEdit()
+        self.diag_text.setReadOnly(True)
+        self.diag_text.setStyleSheet("font-family:%s;font-size:12px;" % _MONO)
+        dl.addWidget(self.diag_text)
+        lay.addWidget(diag, 1)
+        return w
+
+    def _layer_row(self):
+        combo = QComboBox()
+        combo.setMinimumWidth(380)
+        browse = QPushButton("...")
+        browse.setFixedWidth(34)
+        browse.setToolTip("Open a raster file from disk")
+        browse.clicked.connect(lambda: self.browse_raster(combo))
+        band = QSpinBox()
+        band.setRange(1, 999)
+        band.setPrefix("band ")
+        band.setFixedWidth(90)
+        row = QHBoxLayout()
+        row.addWidget(combo, 1)
+        row.addWidget(browse)
+        row.addWidget(band)
+        return combo, self._wrap(row), band
+
+    @staticmethod
+    def _wrap(layout):
+        w = QWidget()
+        w.setLayout(layout)
+        return w
+
+    # -- tab 2 ------------------------------------------------------------
+    def _tab_classes(self):
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        note = QLabel(
+            "The census below is a complete pass over both rasters inside the "
+            "common area. It supplies the class inventory, the uncorrected map "
+            "areas, and - for a stratified design - the stratum weights that "
+            "the estimator needs.")
+        note.setWordWrap(True)
+        note.setStyleSheet("color:#4a5a68;background:#f2f6f8;padding:9px;"
+                           "border-radius:4px;")
+        lay.addWidget(note)
+
+        self.census_text = QTextEdit()
+        self.census_text.setReadOnly(True)
+        self.census_text.setStyleSheet("font-family:%s;font-size:12px;" % _MONO)
+        lay.addWidget(self.census_text, 1)
+
+        row = QHBoxLayout()
+        self.map_button = QPushButton("Edit class mapping...")
+        self.map_button.clicked.connect(self.edit_mapping)
+        row.addWidget(self.map_button)
+        row.addStretch()
+        lay.addLayout(row)
+
+        self.mapping_text = QTextEdit()
+        self.mapping_text.setReadOnly(True)
+        self.mapping_text.setMaximumHeight(190)
+        self.mapping_text.setStyleSheet("font-family:%s;font-size:12px;" % _MONO)
+        lay.addWidget(self.mapping_text)
+        return w
+
+    # -- tab 3 ------------------------------------------------------------
+    def _tab_design(self):
+        outer = QScrollArea()
+        outer.setWidgetResizable(True)
+        w = QWidget()
+        lay = QVBoxLayout(w)
+
+        design = QGroupBox("Sampling design")
+        dl = QVBoxLayout(design)
+        self.method_group = QButtonGroup(self)
+        self.rb_random = QRadioButton(
+            "Simple random - equal inclusion probability for every pixel")
+        self.rb_random.setChecked(True)
+        self.rb_systematic = QRadioButton(
+            "Systematic with a random start - even spatial coverage")
+        self.rb_stratified = QRadioButton(
+            "Stratified random - required if rare classes matter (recommended)")
+        self.rb_points = QRadioButton("Use my own points from a CSV file")
+        for i, b in enumerate((self.rb_random, self.rb_systematic,
+                               self.rb_stratified, self.rb_points), start=1):
+            self.method_group.addButton(b, i)
+            b.toggled.connect(self._method_changed)
+            dl.addWidget(b)
+        lay.addWidget(design)
+
+        common = QGroupBox("Sample")
+        cf = QFormLayout(common)
+        self.n_points = QSpinBox()
+        self.n_points.setRange(10, 2000000)
+        self.n_points.setValue(500)
+        self.n_points.setSingleStep(50)
+        size_row = QHBoxLayout()
+        size_row.addWidget(self.n_points)
+        self.size_button = QPushButton("Sample size planner...")
+        self.size_button.clicked.connect(self.open_size_planner)
+        size_row.addWidget(self.size_button)
+        size_row.addStretch()
+        cf.addRow("Number of validation units:", self._wrap(size_row))
+
+        self.seed = QSpinBox()
+        self.seed.setRange(0, 2 ** 31 - 2)
+        self.seed.setValue(42)
+        self.seed_check = QCheckBox("fix the seed (reproducible sample)")
+        self.seed_check.setChecked(True)
+        self.seed_check.toggled.connect(self.seed.setEnabled)
+        seed_row = QHBoxLayout()
+        seed_row.addWidget(self.seed)
+        seed_row.addWidget(self.seed_check)
+        seed_row.addStretch()
+        cf.addRow("Random seed:", self._wrap(seed_row))
+
+        self.min_sep = QDoubleSpinBox()
+        self.min_sep.setRange(0.0, 1e9)
+        self.min_sep.setDecimals(2)
+        self.min_sep.setValue(0.0)
+        self.min_sep.setSuffix(" map units")
+        self.min_sep.setToolTip(
+            "Thinning the sample changes the inclusion probabilities; the "
+            "report says so wherever it is used. 0 disables it.")
+        cf.addRow("Minimum separation between units:", self.min_sep)
+
+        self.conf_level = QComboBox()
+        self.conf_level.addItem("95 %", 0.95)
+        self.conf_level.addItem("90 %", 0.90)
+        self.conf_level.addItem("99 %", 0.99)
+        cf.addRow("Confidence level:", self.conf_level)
+        lay.addWidget(common)
+
+        self.strat_box = QGroupBox("Stratification")
+        sf = QFormLayout(self.strat_box)
+        self.strata_source = QComboBox()
+        self.strata_source.addItem(
+            "Classified map (standard, Olofsson et al. 2014)", "map")
+        self.strata_source.addItem("Reference map", "reference")
+        sf.addRow("Strata come from:", self.strata_source)
+        self.allocation = QComboBox()
+        for label, key in (("Proportional (self-weighting)", "proportional"),
+                           ("Proportional with a floor for rare classes",
+                            "olofsson"),
+                           ("Neyman / optimal for overall accuracy", "neyman"),
+                           ("Equal per stratum", "equal")):
+            self.allocation.addItem(label, key)
+        sf.addRow("Allocation:", self.allocation)
+        self.min_per_stratum = QSpinBox()
+        self.min_per_stratum.setRange(0, 100000)
+        self.min_per_stratum.setValue(30)
+        sf.addRow("Minimum units per stratum:", self.min_per_stratum)
+        hint = QLabel(
+            "Stratum weights are taken from the census, and the estimator "
+            "reweights the sample back to the map proportions (Olofsson et al. "
+            "2014, Eqs. 4-10). Without that step a stratified sample "
+            "over-represents rare classes and every accuracy figure is biased.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#4a5a68;")
+        sf.addRow("", hint)
+        self.strat_box.setEnabled(False)
+        lay.addWidget(self.strat_box)
+
+        self.csv_box = QGroupBox("Validation points from a CSV file")
+        pf = QFormLayout(self.csv_box)
+        self.csv_path = QLineEdit()
+        self.csv_path.setReadOnly(True)
+        pick = QPushButton("Browse...")
+        pick.clicked.connect(self.browse_csv)
+        crow = QHBoxLayout()
+        crow.addWidget(self.csv_path, 1)
+        crow.addWidget(pick)
+        pf.addRow("File (id,x,y,reference_value):", self._wrap(crow))
+        self.csv_crs = QComboBox()
+        self.csv_crs.addItem("WGS 84 (EPSG:4326)", "EPSG:4326")
+        self.csv_crs.addItem("Same as the reference raster", "layer")
+        pf.addRow("Coordinates are in:", self.csv_crs)
+        self.csv_use_values = QCheckBox(
+            "Use the reference_value column instead of the reference raster")
+        self.csv_use_values.setChecked(True)
+        pf.addRow("", self.csv_use_values)
+        self.declared_design = QComboBox()
+        self.declared_design.addItem("Simple random / equal probability", "srs")
+        self.declared_design.addItem("Systematic", "systematic")
+        pf.addRow("Design that produced the points:", self.declared_design)
+        warn = QLabel(
+            "Standard errors are only inferential if the points were drawn by "
+            "a probability rule. Purposive or convenience points give "
+            "descriptive numbers, and the report states that.")
+        warn.setWordWrap(True)
+        warn.setStyleSheet("color:#8a5a00;")
+        pf.addRow("", warn)
+        self.csv_box.setEnabled(False)
+        lay.addWidget(self.csv_box)
+
+        self.cont_box = QGroupBox("Continuous mode")
+        cl = QFormLayout(self.cont_box)
+        self.bootstrap = QSpinBox()
+        self.bootstrap.setRange(0, 100000)
+        self.bootstrap.setValue(2000)
+        self.bootstrap.setSingleStep(500)
+        cl.addRow("Bootstrap replicates for confidence intervals:",
+                  self.bootstrap)
+        self.cont_box.setEnabled(False)
+        lay.addWidget(self.cont_box)
+
+        lay.addStretch()
+        outer.setWidget(w)
+        return outer
+
+    # -- tab 4 ------------------------------------------------------------
+    def _tab_results(self):
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        self.result_tabs = QTabWidget()
+
+        self.summary_text = QTextEdit()
+        self.summary_text.setReadOnly(True)
+        self.summary_text.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+        self.summary_text.setStyleSheet("font-family:%s;font-size:12px;" % _MONO)
+        self.result_tabs.addTab(self.summary_text, "Full report")
+
+        self.matrix_table = QTableWidget()
+        self.result_tabs.addTab(self._panel(
+            self.matrix_table,
+            "Rows = map (classified) class, columns = reference class. The "
+            "upper block holds the sample counts, the lower block the "
+            "estimated area proportions."), "Error matrix")
+
+        self.class_table = QTableWidget()
+        self.result_tabs.addTab(self._panel(
+            self.class_table,
+            "User's accuracy = 1 - commission error; producer's accuracy = "
+            "1 - omission error. Intervals are at the confidence level chosen "
+            "on the Design tab; an asterisk marks a Wilson score interval, "
+            "substituted where the normal approximation is unreliable (for an "
+            "accuracy of exactly 1.0 the usual interval would collapse to zero "
+            "width)."), "Per class")
+
+        self.area_table = QTableWidget()
+        self.result_tabs.addTab(self._panel(
+            self.area_table,
+            "Adjusted areas remove the bias left by pixel counting (Olofsson "
+            "et al. 2014, Eqs. 9-10). A mapped area outside the interval of "
+            "the adjusted area is highlighted: pixel counting alone would have "
+            "misled."), "Area")
+
+        self.dis_table = QTableWidget()
+        self.result_tabs.addTab(self._panel(
+            self.dis_table,
+            "Quantity disagreement is a difference in how much of a class "
+            "exists; allocation disagreement is a difference in where it is "
+            "(Pontius & Millones 2011)."), "Disagreement")
+
+        self.caveat_text = QTextEdit()
+        self.caveat_text.setReadOnly(True)
+        self.result_tabs.addTab(self.caveat_text, "Caveats")
+        lay.addWidget(self.result_tabs, 1)
+
+        row = QHBoxLayout()
+        for label, slot in (("Export report (TXT)", self.export_txt),
+                            ("Export JSON", self.export_json),
+                            ("Export HTML", self.export_html),
+                            ("Export matrix (CSV)", self.export_csv),
+                            ("Export validation points", self.export_points)):
+            b = QPushButton(label)
+            b.clicked.connect(slot)
+            b.setEnabled(False)
+            row.addWidget(b)
+            self._export_buttons.append(b)
+        row.addStretch()
+        lay.addLayout(row)
+        return w
+
+    @staticmethod
+    def _panel(table, caption):
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        note = QLabel(caption)
+        note.setWordWrap(True)
+        note.setStyleSheet("color:#4a5a68;background:#f2f6f8;padding:7px;"
+                           "border-radius:4px;")
+        lay.addWidget(note)
+        lay.addWidget(table, 1)
+        return w
+
+    # -- reactions --------------------------------------------------------
+    def _mode_changed(self):
+        categorical = self.mode_categorical.isChecked()
+        self.cont_box.setEnabled(not categorical)
+        self.rb_stratified.setEnabled(categorical)
+        if not categorical and self.rb_stratified.isChecked():
+            self.rb_random.setChecked(True)
+
+    def _method_changed(self):
+        self.strat_box.setEnabled(self.rb_stratified.isChecked())
+        self.csv_box.setEnabled(self.rb_points.isChecked())
+        self.n_points.setEnabled(not self.rb_points.isChecked())
+
+    # -- layers -----------------------------------------------------------
+    def reload_layers(self):
+        for combo in (self.ref_combo, self.cls_combo):
+            current = combo.currentData()
+            combo.clear()
+            for layer in QgsProject.instance().mapLayers().values():
+                if isinstance(layer, QgsRasterLayer) and layer.isValid():
+                    combo.addItem(layer.name(), layer)
+            if current is not None:
+                idx = combo.findData(current)
+                if idx >= 0:
+                    combo.setCurrentIndex(idx)
+
+    def browse_raster(self, combo):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select a raster file", "",
+            "Raster files (*.tif *.tiff *.img *.asc *.vrt *.jp2 *.bil *.dat);;"
+            "All files (*.*)")
+        if not path:
+            return
         for i in range(combo.count()):
-            existing_layer = combo.itemData(i)
-            if existing_layer is not None and existing_layer.source() == file_path:
+            layer = combo.itemData(i)
+            if layer is not None and layer.source() == path:
                 combo.setCurrentIndex(i)
                 return
-
-        layer_name = os.path.splitext(os.path.basename(file_path))[0]
-        layer = QgsRasterLayer(file_path, layer_name)
-
+        layer = QgsRasterLayer(path, os.path.splitext(os.path.basename(path))[0])
         if not layer.isValid():
-            QMessageBox.critical(self, "Hata / Error",
-                f"Raster dosyası açılamadı / Could not open raster file:\n{file_path}")
+            QMessageBox.critical(self, PLUGIN_NAME,
+                                 "The raster could not be opened:\n%s" % path)
             return
-
         QgsProject.instance().addMapLayer(layer)
         combo.addItem(layer.name(), layer)
         combo.setCurrentIndex(combo.count() - 1)
 
-    def raster_to_array(self, layer):
-        """Raster katmanının 1. bandını (height, width) numpy dizisine dönüştürür.
-        NoData pikselleri NaN olarak işaretlenir. Performans için block.data()
-        üzerinden vektörize okuma yapılır; desteklenmeyen/eşleşmeyen veri tipinde
-        piksel piksel okumaya (yavaş ama güvenli) düşer."""
-        provider = layer.dataProvider()
-        extent = layer.extent()
-        width = layer.width()
-        height = layer.height()
-        block = provider.block(1, extent, width, height)
+    def browse_csv(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select the validation point file", "",
+            "CSV files (*.csv *.txt);;All files (*.*)")
+        if path:
+            self.csv_path.setText(path)
 
-        # Qgis.DataType sabit değerleri (QGIS 3.x/4.x arası kararlı)
-        dtype_map = {
-            1: np.uint8, 2: np.uint16, 3: np.int16, 4: np.uint32,
-            5: np.int32, 6: np.float32, 7: np.float64, 14: np.int8,
-        }
-        np_dtype = dtype_map.get(int(block.dataType()))
-
-        if np_dtype is not None:
-            try:
-                raw = np.frombuffer(block.data(), dtype=np_dtype)
-                if raw.size == width * height:
-                    array = raw.reshape((height, width)).astype(np.float64)
-                    if block.hasNoDataValue():
-                        array[array == block.noDataValue()] = np.nan
-                    return array
-            except ValueError:
-                pass
-
-        # Fallback: piksel piksel okuma
-        array = np.full((height, width), np.nan)
-        nodata = block.noDataValue() if block.hasNoDataValue() else None
-        for y in range(height):
-            for x in range(width):
-                val = block.value(y, x)
-                if nodata is not None and val == nodata:
-                    continue
-                array[y, x] = val
-        return array
-
-    def generate_sampling_points(self, reference_layer, n_points, method):
-        """Örnekleme noktaları oluştur"""
-        extent = reference_layer.extent()
-
-        points = []
-        max_attempts = n_points * 100
-        attempts = 0
-        
-        if method == 'random':
-            while len(points) < n_points and attempts < max_attempts:
-                x = random.uniform(extent.xMinimum(), extent.xMaximum())
-                y = random.uniform(extent.yMinimum(), extent.yMaximum())
-                
-                pixel_x = int((x - extent.xMinimum()) / reference_layer.rasterUnitsPerPixelX())
-                pixel_y = int((extent.yMaximum() - y) / reference_layer.rasterUnitsPerPixelY())
-                
-                if 0 <= pixel_x < reference_layer.width() and 0 <= pixel_y < reference_layer.height():
-                    points.append({
-                        'x': pixel_x,
-                        'y': pixel_y,
-                        'coord_x': x,
-                        'coord_y': y
-                    })
-                    
-                attempts += 1
-                
-        elif method == 'systematic':
-            grid_size = int(np.sqrt(n_points))
-            x_step = reference_layer.width() / grid_size
-            y_step = reference_layer.height() / grid_size
-            
-            for i in range(grid_size):
-                for j in range(grid_size):
-                    if len(points) >= n_points:
-                        break
-                        
-                    pixel_x = int(i * x_step + x_step / 2)
-                    pixel_y = int(j * y_step + y_step / 2)
-                    
-                    if 0 <= pixel_x < reference_layer.width() and 0 <= pixel_y < reference_layer.height():
-                        x = extent.xMinimum() + pixel_x * reference_layer.rasterUnitsPerPixelX()
-                        y = extent.yMaximum() - pixel_y * reference_layer.rasterUnitsPerPixelY()
-                        
-                        points.append({
-                            'x': pixel_x,
-                            'y': pixel_y,
-                            'coord_x': x,
-                            'coord_y': y
-                        })
-                        
-        elif method == 'stratified':
-            reference_array = self.raster_to_array(reference_layer)
-            valid_mask = ~np.isnan(reference_array) & (reference_array != -9999)
-
-            unique_classes = np.unique(reference_array[valid_mask])
-            points_per_class = n_points // len(unique_classes)
-            
-            for class_val in unique_classes:
-                class_points = np.argwhere(reference_array == class_val)
-                
-                if len(class_points) > 0:
-                    n_sample = min(points_per_class, len(class_points))
-                    sampled_indices = np.random.choice(len(class_points), n_sample, replace=False)
-                    
-                    for idx in sampled_indices:
-                        pixel_y, pixel_x = class_points[idx]
-                        x = extent.xMinimum() + pixel_x * reference_layer.rasterUnitsPerPixelX()
-                        y = extent.yMaximum() - pixel_y * reference_layer.rasterUnitsPerPixelY()
-                        
-                        points.append({
-                            'x': int(pixel_x),
-                            'y': int(pixel_y),
-                            'coord_x': float(x),
-                            'coord_y': float(y)
-                        })
-                        
-        return points
-        
-    def run_validation(self):
-        """CARAS doğrulama analizini çalıştır"""
-        try:
-            if self.csv_radio.isChecked():
-                classified_layer = self.classified_combo.currentData()
-                
-                if not classified_layer:
-                    QMessageBox.warning(self, "Uyarı / Warning", 
-                        "Lütfen sınıflandırılmış haritayı seçin!\n"
-                        "Please select the classified map!")
-                    return
-                    
-                reference_layer = None
-            else:
-                reference_layer = self.reference_combo.currentData()
-                classified_layer = self.classified_combo.currentData()
-                
-                if not reference_layer or not classified_layer:
-                    QMessageBox.warning(self, "Uyarı / Warning", 
-                        "Lütfen her iki haritayı da seçin!\n"
-                        "Please select both maps!")
-                    return
-                
-            self.progress_bar.setVisible(True)
-            self.progress_bar.setValue(0)
-            self.result_text.clear()
-            self.result_text.append("⏳ CARAS analizi başlatılıyor...\n⏳ Starting CARAS analysis...\n")
-            QApplication.processEvents()
-            
-            self.progress_bar.setValue(10)
-            
-            csv_reference_values = None
-            point_ids = None
-            
-            if self.csv_radio.isChecked():
-                csv_path = self.csv_path_edit.text()
-                if not csv_path:
-                    QMessageBox.warning(self, "Uyarı / Warning",
-                        "Lütfen CSV dosyası seçin!\n"
-                        "Please select a CSV file!")
-                    self.progress_bar.setVisible(False)
-                    return
-                
-                self.result_text.append("📍 CSV'den noktalar yükleniyor...\n📍 Loading points from CSV...\n")
-                QApplication.processEvents()
-                
-                self.sampled_points, csv_reference_values, point_ids = self.load_points_from_csv(csv_path, classified_layer)
-                
-                if not self.sampled_points:
-                    QMessageBox.critical(self, "Hata / Error", 
-                        "CSV'den nokta yüklenemedi!\n"
-                        "Could not load points from CSV!")
-                    self.progress_bar.setVisible(False)
-                    return
-                    
-                self.result_text.append(f"✓ {len(self.sampled_points)} nokta CSV'den yüklendi\n"
-                                      f"✓ {len(self.sampled_points)} points loaded from CSV\n")
-            else:
-                self.result_text.append("📍 Örnekleme noktaları oluşturuluyor...\n📍 Generating sampling points...\n")
-                QApplication.processEvents()
-                
-                n_points = self.points_spin.value()
-                method_id = self.method_group.checkedId()
-                method = {1: 'random', 2: 'stratified', 3: 'systematic'}[method_id]
-                
-                self.sampled_points = self.generate_sampling_points(reference_layer, n_points, method)
-                
-                if not self.sampled_points:
-                    QMessageBox.critical(self, "Hata / Error", 
-                        "Örnekleme noktaları oluşturulamadı!\n"
-                        "Could not generate sampling points!")
-                    self.progress_bar.setVisible(False)
-                    return
-                    
-                self.result_text.append(f"✓ {len(self.sampled_points)} nokta oluşturuldu\n"
-                                      f"✓ {len(self.sampled_points)} points generated\n")
-            QApplication.processEvents()
-            
-            self.progress_bar.setValue(30)
-            self.result_text.append("\n📊 Raster verileri okunuyor...\n📊 Reading raster data...\n")
-            QApplication.processEvents()
-            
-            class_extent = classified_layer.extent()
-            classified_data = self.raster_to_array(classified_layer)
-
-            if not self.csv_radio.isChecked():
-                ref_extent = reference_layer.extent()
-                reference_data = self.raster_to_array(reference_layer)
-            
-            self.progress_bar.setValue(50)
-            
-            if csv_reference_values is not None:
-                reference_values = []
-                classified_values = []
-                valid_points = []
-                
-                class_extent = classified_layer.extent()
-                
-                for i, point in enumerate(self.sampled_points):
-                    coord_x = point['coord_x']
-                    coord_y = point['coord_y']
-                    
-                    class_pixel_x = int((coord_x - class_extent.xMinimum()) / classified_layer.rasterUnitsPerPixelX())
-                    class_pixel_y = int((class_extent.yMaximum() - coord_y) / classified_layer.rasterUnitsPerPixelY())
-                    
-                    if (0 <= class_pixel_x < classified_layer.width() and 
-                        0 <= class_pixel_y < classified_layer.height()):
-                        
-                        class_val = classified_data[class_pixel_y, class_pixel_x]
-                        ref_val = csv_reference_values[i]
-                        
-                        is_ref_valid = not (np.isnan(ref_val) or ref_val == -9999 or ref_val is None)
-                        is_class_valid = not (np.isnan(class_val) or class_val == -9999 or class_val is None)
-                        
-                        if is_ref_valid and is_class_valid:
-                            reference_values.append(ref_val)
-                            classified_values.append(class_val)
-                            valid_points.append(point)
-                
-                self.sampled_points = valid_points
-                self.result_text.append(f"✓ CSV referans değerleri kullanıldı\n"
-                                      f"✓ Using CSV reference values\n")
-                
-            else:
-                reference_values = []
-                classified_values = []
-                
-                ref_extent = reference_layer.extent()
-                class_extent = classified_layer.extent()
-                
-                valid_points = []
-                
-                for point in self.sampled_points:
-                    coord_x = point['coord_x']
-                    coord_y = point['coord_y']
-                    
-                    ref_pixel_x = int((coord_x - ref_extent.xMinimum()) / reference_layer.rasterUnitsPerPixelX())
-                    ref_pixel_y = int((ref_extent.yMaximum() - coord_y) / reference_layer.rasterUnitsPerPixelY())
-                    
-                    class_pixel_x = int((coord_x - class_extent.xMinimum()) / classified_layer.rasterUnitsPerPixelX())
-                    class_pixel_y = int((class_extent.yMaximum() - coord_y) / classified_layer.rasterUnitsPerPixelY())
-                    
-                    if (0 <= ref_pixel_x < reference_layer.width() and 
-                        0 <= ref_pixel_y < reference_layer.height() and
-                        0 <= class_pixel_x < classified_layer.width() and 
-                        0 <= class_pixel_y < classified_layer.height()):
-                        
-                        ref_val = reference_data[ref_pixel_y, ref_pixel_x]
-                        class_val = classified_data[class_pixel_y, class_pixel_x]
-                        
-                        is_ref_valid = not (np.isnan(ref_val) or ref_val == -9999 or ref_val is None)
-                        is_class_valid = not (np.isnan(class_val) or class_val == -9999 or class_val is None)
-                        
-                        if is_ref_valid and is_class_valid:
-                            reference_values.append(ref_val)
-                            classified_values.append(class_val)
-                            valid_points.append(point)
-                
-                self.sampled_points = valid_points
-            
-            if len(reference_values) == 0:
-                QMessageBox.critical(self, "Hata / Error", 
-                    "Geçerli örnekleme noktası bulunamadı!\n"
-                    "No valid sampling points found!\n"
-                    "Raster haritalarının extent ve CRS değerlerini kontrol edin.")
-                self.progress_bar.setVisible(False)
-                return
-            
-            self.result_text.append(f"✓ {len(reference_values)} geçerli nokta kullanılıyor\n"
-                                  f"✓ Using {len(reference_values)} valid points\n")
-            QApplication.processEvents()
-            
-            self.result_text.append("\n🔍 Tüm sınıf değerleri okunuyor...\n🔍 Reading all class values...\n")
-            QApplication.processEvents()
-            
-            class_valid_mask = ~np.isnan(classified_data) & (classified_data != -9999)
-            class_unique_values = set(classified_data[class_valid_mask].tolist())
-
-            if csv_reference_values is not None:
-                ref_unique_values = set(reference_values)
-            else:
-                ref_valid_mask = ~np.isnan(reference_data) & (reference_data != -9999)
-                ref_unique_values = set(reference_data[ref_valid_mask].tolist())
-            
-            self.result_text.append(f"✓ Referans: {len(ref_unique_values)} benzersiz sınıf\n")
-            self.result_text.append(f"✓ Reference: {len(ref_unique_values)} unique classes\n")
-            self.result_text.append(f"✓ Sınıflandırılmış: {len(class_unique_values)} benzersiz sınıf\n")
-            self.result_text.append(f"✓ Classified: {len(class_unique_values)} unique classes\n")
-            QApplication.processEvents()
-            
-            self.result_text.append("\n🔄 Sınıf eşleştirme bekleniyor...\n🔄 Waiting for class mapping...\n")
-            QApplication.processEvents()
-            
-            mapping_dialog = ClassMappingDialog(list(ref_unique_values), list(class_unique_values), self)
-            if mapping_dialog.exec() != QDialog.DialogCode.Accepted:
-                self.progress_bar.setVisible(False)
-                self.result_text.append("\n❌ Analiz iptal edildi\n❌ Analysis cancelled\n")
-                return
-                
-            reference_mapping, classified_mapping, class_names = mapping_dialog.get_mappings()
-            
-            self.progress_bar.setValue(60)
-            self.result_text.append("\n🔢 Sınıf kategorileri uygulanıyor...\n🔢 Applying class categories...\n")
-            QApplication.processEvents()
-            
-            all_categories = sorted(set(list(reference_mapping.values()) + list(classified_mapping.values())))
-            
-            reference_categories = []
-            classified_categories = []
-            
-            for ref_val, class_val in zip(reference_values, classified_values):
-                if ref_val in reference_mapping and class_val in classified_mapping:
-                    reference_categories.append(reference_mapping[ref_val])
-                    classified_categories.append(classified_mapping[class_val])
-            
-            sorted_categories = sorted(all_categories)
-            category_labels = [class_names.get(cat, f"Kategori_{cat}") for cat in sorted_categories]
-            
-            self.result_text.append(f"✓ Toplam {len(all_categories)} kategori tanımlandı\n")
-            self.result_text.append(f"✓ Total {len(all_categories)} categories defined\n")
-            for cat in sorted_categories:
-                self.result_text.append(f"  - Kategori {cat}: {class_names.get(cat, f'Kategori_{cat}')}\n")
-            QApplication.processEvents()
-            
-            self.progress_bar.setValue(80)
-            self.result_text.append("\n📈 Metrikler hesaplanıyor...\n📈 Calculating metrics...\n")
-            QApplication.processEvents()
-            
-            cm = confusion_matrix(reference_categories, classified_categories, labels=sorted_categories)
-            overall_accuracy = accuracy_score(reference_categories, classified_categories)
-            kappa = cohen_kappa_score(reference_categories, classified_categories)
-            
-            f1_macro = f1_score(reference_categories, classified_categories, 
-                               labels=sorted_categories, average='macro', zero_division=0)
-            f1_weighted = f1_score(reference_categories, classified_categories, 
-                                  labels=sorted_categories, average='weighted', zero_division=0)
-            precision_macro = precision_score(reference_categories, classified_categories, 
-                                             labels=sorted_categories, average='macro', zero_division=0)
-            recall_macro = recall_score(reference_categories, classified_categories, 
-                                       labels=sorted_categories, average='macro', zero_division=0)
-            
-            ref_arr = np.array(reference_values, dtype=float)
-            cls_arr = np.array(classified_values, dtype=float)
-            
-            r2 = r2_score(ref_arr, cls_arr)
-            rmse = np.sqrt(mean_squared_error(ref_arr, cls_arr))
-            mae = mean_absolute_error(ref_arr, cls_arr)
-            bias = float(np.mean(cls_arr - ref_arr))
-            
-            ref_cat_arr = np.array(reference_categories, dtype=float)
-            cls_cat_arr = np.array(classified_categories, dtype=float)
-            
-            r2_cat = r2_score(ref_cat_arr, cls_cat_arr)
-            rmse_cat = np.sqrt(mean_squared_error(ref_cat_arr, cls_cat_arr))
-            mae_cat = mean_absolute_error(ref_cat_arr, cls_cat_arr)
-            bias_cat = float(np.mean(cls_cat_arr - ref_cat_arr))
-            
-            class_report = classification_report(
-                reference_categories, 
-                classified_categories,
-                labels=sorted_categories,
-                target_names=category_labels,
-                zero_division=0,
-                output_dict=True
-            )
-            
-            self.progress_bar.setValue(90)
-            
-            self.validation_results = {
-                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'plugin': 'CARAS - Classification Accuracy and Regression Assessment Suite',
-                'reference_map': 'CSV Data' if csv_reference_values is not None else reference_layer.name(),
-                'classified_map': classified_layer.name(),
-                'n_points': len(reference_categories),
-                'sampling_method': 'CSV File' if csv_reference_values is not None else method,
-                'overall_accuracy': float(overall_accuracy),
-                'kappa': float(kappa),
-                'f1_macro': float(f1_macro),
-                'f1_weighted': float(f1_weighted),
-                'precision_macro': float(precision_macro),
-                'recall_macro': float(recall_macro),
-                'r2': float(r2),
-                'rmse': float(rmse),
-                'mae': float(mae),
-                'bias': float(bias),
-                'r2_cat': float(r2_cat),
-                'rmse_cat': float(rmse_cat),
-                'mae_cat': float(mae_cat),
-                'bias_cat': float(bias_cat),
-                'confusion_matrix': cm.tolist(),
-                'class_names': category_labels,
-                'class_report': class_report,
-                'all_categories': sorted_categories
-            }
-            
-            self.display_results()
-            
-            self.progress_bar.setValue(100)
-            self.export_button.setEnabled(True)
-            self.save_points_button.setEnabled(True)
-            
-            QMessageBox.information(self, "Başarılı / Success", 
-                "✓ CARAS analizi tamamlandı!\n"
-                "✓ CARAS analysis completed!")
-            
-        except Exception as e:
-            QMessageBox.critical(self, "Hata / Error", 
-                f"Analiz sırasında hata oluştu / Error during analysis:\n{str(e)}")
-        finally:
-            self.progress_bar.setVisible(False)
-            
-    def display_results(self):
-        """Sonuçları göster"""
-        results = self.validation_results
-        
-        output = "=" * 80 + "\n"
-        output += "CARAS — Classification Accuracy and Regression Assessment Suite\n"
-        output += "=" * 80 + "\n\n"
-        
-        output += f"📅 Analiz Tarihi / Analysis Date: {results['timestamp']}\n"
-        output += f"📍 Nokta Sayısı / Number of Points: {results['n_points']}\n"
-        output += f"🎯 Örnekleme Metodu / Sampling Method: {results['sampling_method'].upper()}\n\n"
-        
-        output += "-" * 80 + "\n"
-        output += "PRIMARY METRICS / TEMEL METRİKLER\n"
-        output += "-" * 80 + "\n"
-        output += f"Overall Accuracy (OA)       : {results['overall_accuracy']:.4f} ({results['overall_accuracy']*100:.2f}%)\n"
-        output += f"Cohen's Kappa (κ)           : {results['kappa']:.4f}\n"
-        output += f"F1-Score (Macro)            : {results['f1_macro']:.4f}\n"
-        output += f"F1-Score (Weighted)         : {results['f1_weighted']:.4f}\n"
-        output += f"Precision (Macro)           : {results['precision_macro']:.4f}\n"
-        output += f"Recall (Macro)              : {results['recall_macro']:.4f}\n\n"
-        
-        kappa_val = results['kappa']
-        if kappa_val < 0:
-            kappa_interp = "Poor (Zayıf)"
-        elif kappa_val < 0.20:
-            kappa_interp = "Slight (Hafif)"
-        elif kappa_val < 0.40:
-            kappa_interp = "Fair (Orta)"
-        elif kappa_val < 0.60:
-            kappa_interp = "Moderate (İyi)"
-        elif kappa_val < 0.80:
-            kappa_interp = "Substantial (Çok İyi)"
-        else:
-            kappa_interp = "Almost Perfect (Mükemmel)"
-            
-        output += f"Kappa Interpretation        : {kappa_interp}\n\n"
-        
-        output += "-" * 80 + "\n"
-        output += "REGRESSION STATISTICS (Raw Pixel Values) / REGRESYON İSTATİSTİKLERİ (Ham Piksel)\n"
-        output += "-" * 80 + "\n"
-        output += f"R² (Coeff. of Determination): {results['r2']:.4f}\n"
-        output += f"RMSE (Root Mean Sq. Error) : {results['rmse']:.4f}\n"
-        output += f"MAE  (Mean Absolute Error)  : {results['mae']:.4f}\n"
-        output += f"Bias (Mean Error)           : {results['bias']:.4f}"
-        bias_dir = " (Overestimation / Fazla Tahmin)" if results['bias'] > 0 else " (Underestimation / Az Tahmin)" if results['bias'] < 0 else " (No Bias / Sapma Yok)"
-        output += f"{bias_dir}\n\n"
-        
-        output += "-" * 80 + "\n"
-        output += "REGRESSION STATISTICS (Category Values) / REGRESYON İSTATİSTİKLERİ (Kategori)\n"
-        output += "-" * 80 + "\n"
-        output += f"R² (Coeff. of Determination): {results['r2_cat']:.4f}\n"
-        output += f"RMSE (Root Mean Sq. Error) : {results['rmse_cat']:.4f}\n"
-        output += f"MAE  (Mean Absolute Error)  : {results['mae_cat']:.4f}\n"
-        output += f"Bias (Mean Error)           : {results['bias_cat']:.4f}"
-        bias_dir_cat = " (Overestimation / Fazla Tahmin)" if results['bias_cat'] > 0 else " (Underestimation / Az Tahmin)" if results['bias_cat'] < 0 else " (No Bias / Sapma Yok)"
-        output += f"{bias_dir_cat}\n\n"
-        output += "-" * 80 + "\n"
-        
-        cm = np.array(results['confusion_matrix'])
-        class_names = results['class_names']
-        
-        header = "Reference \\ Predicted".ljust(25)
-        for name in class_names:
-            header += f"{name[:12]:>14}"
-        output += header + "\n"
-        output += "-" * 80 + "\n"
-        
-        for i, row in enumerate(cm):
-            line = f"{class_names[i][:23]:23}  "
-            for val in row:
-                line += f"{val:>14}"
-            output += line + "\n"
-            
-        output += "\n"
-        
-        output += "-" * 80 + "\n"
-        output += "PER-CLASS METRICS / SINIF BAZLI METRİKLER\n"
-        output += "-" * 80 + "\n"
-        
-        class_report = results['class_report']
-        
-        output += f"{'Class/Sınıf':<25} {'Precision':<12} {'Recall':<12} {'F1-Score':<12} {'Support':<10}\n"
-        output += "-" * 80 + "\n"
-        
-        for class_name in class_names:
-            if class_name in class_report:
-                metrics = class_report[class_name]
-                output += f"{class_name:<25} "
-                output += f"{metrics['precision']:<12.4f} "
-                output += f"{metrics['recall']:<12.4f} "
-                output += f"{metrics['f1-score']:<12.4f} "
-                output += f"{int(metrics['support']):<10}\n"
-                
-        output += "\n"
-        
-        output += "-" * 80 + "\n"
-        output += "PRODUCER'S & USER'S ACCURACY / ÜRETİCİ VE KULLANICI DOĞRULUĞU\n"
-        output += "-" * 80 + "\n"
-        
-        output += f"{'Class/Sınıf':<25} {'Producer Acc.':<15} {'User Acc.':<15}\n"
-        output += "-" * 80 + "\n"
-        
-        for i, class_name in enumerate(class_names):
-            if class_name in class_report:
-                producer_acc = class_report[class_name]['recall']
-                user_acc = class_report[class_name]['precision']
-                
-                output += f"{class_name:<25} "
-                output += f"{producer_acc:<15.4f} "
-                output += f"{user_acc:<15.4f}\n"
-                
-        output += "\n"
-        output += "=" * 80 + "\n"
-        output += "Generated by CARAS — Classification Accuracy and Regression Assessment Suite\n"
-        output += "=" * 80 + "\n"
-        
-        self.result_text.setPlainText(output)
-        
-    def save_validation_points(self):
-        """Doğrulama noktalarını shapefile olarak kaydet"""
-        if not self.sampled_points or not self.validation_results:
-            QMessageBox.warning(self, "Uyarı / Warning", 
-                "Önce CARAS analizi yapmalısınız!\n"
-                "You must run CARAS analysis first!")
+    # -- step 1 -> 2 ------------------------------------------------------
+    def inspect_rasters(self):
+        ref_layer = self.ref_combo.currentData()
+        cls_layer = self.cls_combo.currentData()
+        if ref_layer is None or cls_layer is None:
+            QMessageBox.warning(self, PLUGIN_NAME,
+                                "Select both a reference and a classified "
+                                "raster.")
             return
-            
+        if (ref_layer is cls_layer
+                and self.ref_band.value() == self.cls_band.value()):
+            QMessageBox.warning(self, PLUGIN_NAME,
+                                "Both selections point at the same band of the "
+                                "same raster.")
+            return
         try:
-            file_path, _ = QFileDialog.getSaveFileName(
-                self, "Noktaları Kaydet / Save Points", 
-                f"caras_validation_points_{datetime.now().strftime('%Y%m%d_%H%M%S')}.shp", 
-                "Shapefile (*.shp)"
-            )
-            
-            if not file_path:
+            self.ref_info = rio.describe(ref_layer, self.ref_band.value())
+            self.cls_info = rio.describe(cls_layer, self.cls_band.value())
+        except Exception as exc:
+            QMessageBox.critical(self, PLUGIN_NAME, str(exc))
+            return
+
+        diags = rio.check_pair(self.ref_info, self.cls_info)
+        lines = ["[%-7s] %s" % (d.level.upper(), d.message) for d in diags]
+        lines.append("")
+        for tag, info in (("REFERENCE ", self.ref_info),
+                          ("CLASSIFIED", self.cls_info)):
+            i = info.to_dict()
+            lines.append("%s  %s" % (tag, i["name"]))
+            lines.append("    CRS %s | %d x %d px | pixel %.6g x %.6g %s | %s "
+                         "| NoData %s"
+                         % (i["crs"], i["width"], i["height"],
+                            i["resolution_x"], i["resolution_y"],
+                            i["map_units"], i["data_type"], i["nodata"]))
+        self.diag_text.setPlainText("\n".join(lines))
+
+        if any(d.is_blocking for d in diags):
+            QMessageBox.critical(
+                self, PLUGIN_NAME,
+                "The two rasters cannot be compared as they stand:\n\n"
+                + "\n\n".join(d.message for d in diags if d.is_blocking))
+            return
+
+        if self.mode_categorical.isChecked():
+            if not self._run_census():
                 return
-                
-            if _USE_QVARIANT:
-                fields = [
-                    QgsField("point_id", QVariant.Int),
-                    QgsField("ref_value", QVariant.Double),
-                    QgsField("class_value", QVariant.Double),
-                    QgsField("match", QVariant.String)
-                ]
-            else:
-                from qgis.core import QgsFields
-                fields = [
-                    QgsField("point_id", type=2),
-                    QgsField("ref_value", type=6),
-                    QgsField("class_value", type=6),
-                    QgsField("match", type=10)
-                ]
-            
-            classified_layer = self.classified_combo.currentData()
-            crs = classified_layer.crs()
-            
-            vector_layer = QgsVectorLayer(f"Point?crs={crs.authid()}", "caras_validation_points", "memory")
-            provider = vector_layer.dataProvider()
-            provider.addAttributes(fields)
-            vector_layer.updateFields()
-            
-            features = []
-            
-            is_csv = self.validation_results['reference_map'] == 'CSV Data'
-            
-            if is_csv:
-                class_extent = classified_layer.extent()
-                classified_data = self.raster_to_array(classified_layer)
+            self.tabs.setTabEnabled(1, True)
+            self.tabs.setCurrentIndex(1)
+            if self.reference_mapping is None:
+                self.edit_mapping()
+        else:
+            self.reference_mapping = ana.ClassMapping()
+            self.classified_mapping = ana.ClassMapping()
+            self.category_labels = {}
+            self.tabs.setTabEnabled(2, True)
+            self.tabs.setCurrentIndex(2)
+            self.run_button.setEnabled(True)
 
-                for i, point in enumerate(self.sampled_points):
-                    feature = QgsFeature()
-                    feature.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(point['coord_x'], point['coord_y'])))
-                    
-                    coord_x = point['coord_x']
-                    coord_y = point['coord_y']
-                    
-                    class_pixel_x = int((coord_x - class_extent.xMinimum()) / classified_layer.rasterUnitsPerPixelX())
-                    class_pixel_y = int((class_extent.yMaximum() - coord_y) / classified_layer.rasterUnitsPerPixelY())
-                    
-                    class_val = classified_data[class_pixel_y, class_pixel_x]
-                    ref_val = point.get('ref_value', i+1)
-                    
-                    match = "Yes" if abs(ref_val - class_val) < 0.001 else "No"
-                    
-                    feature.setAttributes([i+1, float(ref_val), float(class_val), match])
-                    features.append(feature)
-            else:
-                reference_layer = self.reference_combo.currentData()
-                
-                ref_extent = reference_layer.extent()
-                class_extent = classified_layer.extent()
-
-                reference_data = self.raster_to_array(reference_layer)
-                classified_data = self.raster_to_array(classified_layer)
-
-                for i, point in enumerate(self.sampled_points):
-                    feature = QgsFeature()
-                    feature.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(point['coord_x'], point['coord_y'])))
-                    
-                    coord_x = point['coord_x']
-                    coord_y = point['coord_y']
-                    
-                    ref_pixel_x = int((coord_x - ref_extent.xMinimum()) / reference_layer.rasterUnitsPerPixelX())
-                    ref_pixel_y = int((ref_extent.yMaximum() - coord_y) / reference_layer.rasterUnitsPerPixelY())
-                    
-                    class_pixel_x = int((coord_x - class_extent.xMinimum()) / classified_layer.rasterUnitsPerPixelX())
-                    class_pixel_y = int((class_extent.yMaximum() - coord_y) / classified_layer.rasterUnitsPerPixelY())
-                    
-                    ref_val = reference_data[ref_pixel_y, ref_pixel_x]
-                    class_val = classified_data[class_pixel_y, class_pixel_x]
-                    match = "Yes" if abs(ref_val - class_val) < 0.001 else "No"
-                    
-                    feature.setAttributes([i+1, float(ref_val), float(class_val), match])
-                    features.append(feature)
-                
-            provider.addFeatures(features)
-            
-            save_options = QgsVectorFileWriter.SaveVectorOptions()
-            save_options.driverName = "ESRI Shapefile"
-            save_options.fileEncoding = "UTF-8"
-            
-            error = QgsVectorFileWriter.writeAsVectorFormatV3(
-                vector_layer,
-                file_path,
-                QgsCoordinateTransformContext(),
-                save_options
-            )
-            
-            if error[0] == QgsVectorFileWriter.WriterError.NoError:
-                saved_layer = QgsVectorLayer(file_path, "CARAS Validation Points", "ogr")
-                QgsProject.instance().addMapLayer(saved_layer)
-                
-                QMessageBox.information(self, "Başarılı / Success", 
-                    f"✓ Noktalar başarıyla kaydedildi!\n"
-                    f"✓ Points saved successfully!\n\n{file_path}")
-            else:
-                QMessageBox.critical(self, "Hata / Error", 
-                    f"Noktalar kaydedilirken hata oluştu / Error saving points:\n{error[1]}")
-                    
-        except Exception as e:
-            QMessageBox.critical(self, "Hata / Error", 
-                f"Noktalar kaydedilirken hata oluştu / Error saving points:\n{str(e)}")
-            
-    def export_results(self):
-        """Sonuçları dosyaya aktar"""
+    def _run_census(self):
+        self.progress.setVisible(True)
+        self.progress.setValue(0)
         try:
-            file_path, _ = QFileDialog.getSaveFileName(
-                self, "Raporu Kaydet / Save Report", 
-                f"caras_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}", 
-                "Text File (*.txt);;JSON File (*.json);;HTML Report (*.html)"
-            )
-            
-            if not file_path:
-                return
-                
-            if file_path.endswith('.json'):
-                with open(file_path, 'w', encoding='utf-8') as f:
-                    json.dump(self.validation_results, f, indent=2, ensure_ascii=False)
-                    
-            elif file_path.endswith('.html'):
-                html_content = self.generate_html_report()
-                with open(file_path, 'w', encoding='utf-8') as f:
-                    f.write(html_content)
-                    
+            self._set_status("Census of the reference raster...")
+            self.ref_census = rio.value_census(
+                self.ref_info,
+                window=intersection_window(self.ref_info, self.cls_info),
+                progress=lambda f: self._tick(50.0 * f))
+            self._set_status("Census of the classified raster...")
+            self.cls_census = rio.value_census(
+                self.cls_info,
+                window=intersection_window(self.cls_info, self.ref_info),
+                progress=lambda f: self._tick(50.0 + 50.0 * f))
+        except Exception as exc:
+            _log(traceback.format_exc())
+            QMessageBox.critical(self, PLUGIN_NAME,
+                                 "The raster census failed:\n%s" % exc)
+            return False
+        finally:
+            self.progress.setVisible(False)
+            self._set_status("")
+
+        for tag, census in (("reference", self.ref_census),
+                            ("classified", self.cls_census)):
+            if census["continuous"]:
+                QMessageBox.warning(
+                    self, PLUGIN_NAME,
+                    "The %s raster holds more than %d distinct values, so it "
+                    "is not a thematic map. Switch to continuous mode, or "
+                    "reclassify it first." % (tag, rio.MAX_UNIQUE_VALUES))
+                return False
+            if census["valid_pixels"] == 0:
+                QMessageBox.warning(
+                    self, PLUGIN_NAME,
+                    "The %s raster holds no valid pixel inside the common "
+                    "area." % tag)
+                return False
+        self._show_census()
+        return True
+
+    def _show_census(self):
+        lines = []
+        for tag, info, census in (
+                ("REFERENCE", self.ref_info, self.ref_census),
+                ("CLASSIFIED", self.cls_info, self.cls_census)):
+            total = max(1, census["valid_pixels"])
+            lines.append("%s  %s" % (tag, info.name))
+            lines.append("    valid pixels %s   NoData %s   distinct values %s"
+                         % ("{:,}".format(census["valid_pixels"]),
+                            "{:,}".format(census["nodata_pixels"]),
+                            census["distinct_count"]))
+            lines.append("    %-14s %14s %10s" % ("value", "pixels", "% valid"))
+            for value, count in census["counts"].items():
+                lines.append("    %-14s %14s %9.4f"
+                             % (_fmt_value(value), "{:,}".format(count),
+                                100.0 * count / total))
+            lines.append("")
+        self.census_text.setPlainText("\n".join(lines))
+
+    def edit_mapping(self):
+        if not self.ref_census or not self.cls_census:
+            QMessageBox.warning(self, PLUGIN_NAME,
+                                "Run the raster inspection first.")
+            return
+        dlg = ClassMappingDialog(self.ref_census, self.cls_census, self,
+                                 self.ref_info.name, self.cls_info.name)
+        if _exec(dlg) != QDialog.DialogCode.Accepted:
+            return
+        self.reference_mapping = dlg.reference_mapping
+        self.classified_mapping = dlg.classified_mapping
+        self.category_labels = dlg.labels
+
+        lines = ["CATEGORY  LABEL", "-" * 60]
+        for cat in sorted(self.category_labels):
+            lines.append("%-9d %s" % (cat, self.category_labels[cat]))
+        lines.append("")
+        for tag, mapping in (("reference", self.reference_mapping),
+                             ("classified", self.classified_mapping)):
+            pairs = sorted(mapping.value_to_category.items())
+            lines.append("%s raster: %s"
+                         % (tag, ", ".join("%s->%d" % (_fmt_value(v), c)
+                                           for v, c in pairs)))
+        self.mapping_text.setPlainText("\n".join(lines))
+
+        self.tabs.setTabEnabled(2, True)
+        self.tabs.setCurrentIndex(2)
+        self.run_button.setEnabled(True)
+
+    # -- sample size planner ----------------------------------------------
+    def open_size_planner(self):
+        if not self.category_labels or not self.cls_census:
+            QMessageBox.information(
+                self, PLUGIN_NAME,
+                "The planner needs the class census. Inspect the rasters and "
+                "define the class mapping first.")
+            return
+        cats = sorted(self.category_labels)
+        use_map = self.strata_source.currentData() == "map"
+        source = self.cls_census if use_map else self.ref_census
+        mapping = self.classified_mapping if use_map else self.reference_mapping
+        per_cat = dict((c, 0) for c in cats)
+        for value, cnt in source["counts"].items():
+            cat = mapping.value_to_category.get(value)
+            if cat is not None:
+                per_cat[cat] = per_cat.get(cat, 0) + int(cnt)
+        total = max(1, sum(per_cat.values()))
+        weights = [per_cat[c] / float(total) for c in cats]
+        labels = [self.category_labels[c] for c in cats]
+        dlg = SampleSizeDialog(weights, labels, self)
+        if _exec(dlg) == QDialog.DialogCode.Accepted and dlg.chosen:
+            self.n_points.setValue(int(dlg.chosen))
+
+    # -- run ---------------------------------------------------------------
+    def _tick(self, percent):
+        self.progress.setValue(int(max(0, min(100, percent))))
+        QApplication.processEvents()
+
+    def _set_status(self, text):
+        self.status.setText(text or "")
+        QApplication.processEvents()
+
+    def _collect_config(self):
+        method = {1: "random", 2: "systematic", 3: "stratified",
+                  4: "points"}[self.method_group.checkedId()]
+        points = ref_values = ids = points_crs = None
+        if method == "points":
+            path = self.csv_path.text().strip()
+            if not path:
+                raise ValueError("Select a CSV file of validation points.")
+            ids, xs, ys, ref_values = _read_points_csv(path)
+            if not xs:
+                raise ValueError("No usable rows were found in the CSV file.")
+            points = (xs, ys)
+            key = self.csv_crs.currentData()
+            points_crs = (self.ref_info.crs if key == "layer"
+                          else QgsCoordinateReferenceSystem(key))
+            if not self.csv_use_values.isChecked():
+                ref_values = None
+
+        return ana.AnalysisConfig(
+            reference_layer=self.ref_combo.currentData(),
+            classified_layer=self.cls_combo.currentData(),
+            reference_band=self.ref_band.value(),
+            classified_band=self.cls_band.value(),
+            mode=("categorical" if self.mode_categorical.isChecked()
+                  else "continuous"),
+            method=method,
+            n_points=self.n_points.value(),
+            seed=(self.seed.value() if self.seed_check.isChecked() else None),
+            allocation=self.allocation.currentData(),
+            min_per_stratum=self.min_per_stratum.value(),
+            strata_source=self.strata_source.currentData(),
+            min_separation=self.min_sep.value(),
+            reference_mapping=self.reference_mapping,
+            classified_mapping=self.classified_mapping,
+            category_labels=self.category_labels,
+            points=points, points_crs=points_crs,
+            points_reference_values=ref_values, points_ids=ids,
+            declared_design=self.declared_design.currentData(),
+            bootstrap=self.bootstrap.value(),
+            confidence_level=self.conf_level.currentData())
+
+    def run_analysis(self):
+        try:
+            config = self._collect_config()
+        except Exception as exc:
+            QMessageBox.warning(self, PLUGIN_NAME, str(exc))
+            return
+
+        self.progress.setVisible(True)
+        self.progress.setValue(0)
+        self.run_button.setEnabled(False)
+        cache = None
+        if config.mode == "categorical" and self.ref_census and self.cls_census:
+            cache = {"reference": self.ref_census,
+                     "classified": self.cls_census}
+        try:
+            self.result = ana.run_analysis(
+                config, progress=lambda f: self._tick(100.0 * f),
+                status=self._set_status, census_cache=cache)
+        except Exception as exc:
+            _log(traceback.format_exc())
+            QMessageBox.critical(
+                self, PLUGIN_NAME,
+                "The analysis could not be completed:\n\n%s" % exc)
+            return
+        finally:
+            self.progress.setVisible(False)
+            self._set_status("")
+            self.run_button.setEnabled(True)
+
+        self._render_results()
+        self.tabs.setTabEnabled(3, True)
+        self.tabs.setCurrentIndex(3)
+        for b in self._export_buttons:
+            b.setEnabled(True)
+
+    # -- rendering ---------------------------------------------------------
+    def _render_results(self):
+        res = self.result
+        self.summary_text.setPlainText(rpt.text_report(res))
+        unique = list(dict.fromkeys(res.warnings))
+        self.caveat_text.setPlainText(
+            "\n\n".join("%d. %s" % (i + 1, w) for i, w in enumerate(unique))
+            or "No caveats were raised by the diagnostics.")
+
+        for table in (self.matrix_table, self.class_table, self.area_table,
+                      self.dis_table):
+            table.clear()
+            table.setRowCount(0)
+            table.setColumnCount(0)
+
+        acc = res.accuracy
+        if acc is None:
+            self.result_tabs.setCurrentIndex(0)
+            return
+        labels = [str(l) for l in acc.labels]
+        k = len(labels)
+        z = res.config.z
+
+        # matrix -----------------------------------------------------------
+        self.matrix_table.setColumnCount(k + 2)
+        self.matrix_table.setRowCount(2 * (k + 2))
+        self.matrix_table.setHorizontalHeaderLabels(
+            ["Map \\ Reference"] + labels + ["Total"])
+        row = 0
+        for block, matrix, fmt in (
+                ("SAMPLE COUNTS", acc.counts, "%d"),
+                ("ESTIMATED AREA PROPORTIONS", acc.proportions, "%.6f")):
+            self.matrix_table.setItem(row, 0, _bold_item(block, left=True))
+            row += 1
+            for i in range(k):
+                self.matrix_table.setItem(row, 0, QTableWidgetItem(labels[i]))
+                total = 0.0
+                for j in range(k):
+                    v = matrix[i][j]
+                    total += v
+                    item = QTableWidgetItem(fmt % v)
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignRight
+                                          | Qt.AlignmentFlag.AlignVCenter)
+                    if i == j:
+                        item.setBackground(QColor("#e6f2ea"))
+                    self.matrix_table.setItem(row, j + 1, item)
+                self.matrix_table.setItem(row, k + 1, _bold_item(fmt % total))
+                row += 1
+            self.matrix_table.setItem(row, 0, _bold_item("Total", left=True))
+            grand = 0.0
+            for j in range(k):
+                s = sum(matrix[i][j] for i in range(k))
+                grand += s
+                self.matrix_table.setItem(row, j + 1, _bold_item(fmt % s))
+            self.matrix_table.setItem(row, k + 1, _bold_item(fmt % grand))
+            row += 1
+        _stretch(self.matrix_table.horizontalHeader())
+
+        # per class ---------------------------------------------------------
+        headers = ["Class", "n (map)", "n (ref)", "User's acc.", "UA interval",
+                   "Producer's acc.", "PA interval", "F1", "Commission",
+                   "Omission"]
+        self.class_table.setColumnCount(len(headers))
+        self.class_table.setRowCount(k)
+        self.class_table.setHorizontalHeaderLabels(headers)
+        for i in range(k):
+            u, p = acc.users[i], acc.producers[i]
+            f1 = acc.f1[i] if i < len(acc.f1) else None
+            cells = [labels[i], str(acc.n_by_map_class[i]),
+                     str(acc.n_by_reference_class[i]),
+                     _n(u.value), _interval(u, z), _n(p.value), _interval(p, z),
+                     _n(f1.value if f1 is not None else None),
+                     _n(acc.commission(i)), _n(acc.omission(i))]
+            for j, text in enumerate(cells):
+                item = QTableWidgetItem(text)
+                if j:
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignRight
+                                          | Qt.AlignmentFlag.AlignVCenter)
+                if j in (1, 2) and acc.n_by_reference_class[i] < 20:
+                    item.setForeground(QColor("#8a5a00"))
+                    item.setToolTip("Fewer than 20 reference units: this "
+                                    "class's producer's accuracy is barely "
+                                    "constrained.")
+                self.class_table.setItem(i, j, item)
+        _stretch(self.class_table.horizontalHeader())
+
+        # area ---------------------------------------------------------------
+        unit = acc.area_unit or ""
+        headers = ["Class", "Map area (%s)" % unit, "Adjusted area (%s)" % unit,
+                   "Margin", "CI lower", "CI upper", "Map share",
+                   "Adjusted share"]
+        rows = acc.areas(z)
+        self.area_table.setColumnCount(len(headers))
+        self.area_table.setRowCount(len(rows))
+        self.area_table.setHorizontalHeaderLabels(headers)
+        for i, r in enumerate(rows):
+            cells = [str(r["label"]), _n(r.get("map_area"), 2),
+                     _n(r.get("adjusted_area"), 2), _n(r.get("area_margin"), 2),
+                     _n(r.get("area_ci_lower"), 2),
+                     _n(r.get("area_ci_upper"), 2),
+                     _pctd(r["map_proportion"]),
+                     _pctd(r["adjusted_proportion"])]
+            outside = False
+            try:
+                outside = not (r["area_ci_lower"] <= r["map_area"]
+                               <= r["area_ci_upper"])
+            except (KeyError, TypeError):
+                outside = False
+            for j, text in enumerate(cells):
+                item = QTableWidgetItem(text)
+                if j:
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignRight
+                                          | Qt.AlignmentFlag.AlignVCenter)
+                if outside:
+                    item.setBackground(QColor("#fdf1e3"))
+                    item.setToolTip("The mapped area falls outside the "
+                                    "confidence interval of the adjusted "
+                                    "area: pixel counting is misleading for "
+                                    "this class.")
+                self.area_table.setItem(i, j, item)
+        _stretch(self.area_table.horizontalHeader())
+
+        # disagreement --------------------------------------------------------
+        d = res.disagreement
+        if d is not None:
+            headers = ["Class", "Quantity", "Allocation", "Exchange", "Shift"]
+            self.dis_table.setColumnCount(len(headers))
+            self.dis_table.setRowCount(len(d.per_category) + 2)
+            self.dis_table.setHorizontalHeaderLabels(headers)
+            for i, r in enumerate(d.per_category):
+                cells = [str(r["label"]), _n(r["quantity"]),
+                         _n(r["allocation"]), _n(r["exchange"]), _n(r["shift"])]
+                for j, text in enumerate(cells):
+                    item = QTableWidgetItem(text)
+                    if j:
+                        item.setTextAlignment(Qt.AlignmentFlag.AlignRight
+                                              | Qt.AlignmentFlag.AlignVCenter)
+                    self.dis_table.setItem(i, j, item)
+            base = len(d.per_category)
+            self.dis_table.setItem(base, 0, _bold_item("TOTAL", left=True))
+            for j, v in enumerate((d.quantity, d.allocation, d.exchange,
+                                   d.shift), start=1):
+                self.dis_table.setItem(base, j, _bold_item(_n(v)))
+            self.dis_table.setItem(
+                base + 1, 0,
+                _bold_item("Total disagreement (1 - OA)", left=True))
+            self.dis_table.setItem(base + 1, 1, _bold_item(_n(d.total)))
+            _stretch(self.dis_table.horizontalHeader())
+
+    # -- exports ------------------------------------------------------------
+    def _save_dialog(self, caption, default_ext, filter_):
+        name = "caras_%s_%s%s" % (
+            self.result.classified_info.name.replace(" ", "_"),
+            datetime.now().strftime("%Y%m%d_%H%M%S"), default_ext)
+        path, _ = QFileDialog.getSaveFileName(self, caption, name, filter_)
+        return path
+
+    def _write(self, path, text):
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(text)
+        except OSError as exc:
+            QMessageBox.critical(self, PLUGIN_NAME,
+                                 "The file could not be written:\n%s" % exc)
+            return
+        QMessageBox.information(self, PLUGIN_NAME, "Saved:\n%s" % path)
+
+    def export_txt(self):
+        path = self._save_dialog("Save the report", ".txt", "Text (*.txt)")
+        if path:
+            self._write(path, rpt.text_report(self.result))
+
+    def export_json(self):
+        path = self._save_dialog("Save the JSON report", ".json",
+                                 "JSON (*.json)")
+        if path:
+            self._write(path, rpt.json_report(self.result))
+
+    def export_html(self):
+        path = self._save_dialog("Save the HTML report", ".html",
+                                 "HTML (*.html)")
+        if path:
+            self._write(path, rpt.html_report(self.result))
+
+    def export_csv(self):
+        path = self._save_dialog("Save the error matrix", ".csv", "CSV (*.csv)")
+        if path:
+            self._write(path, rpt.matrix_csv(self.result))
+
+    def export_points(self):
+        res = self.result
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save the validation points",
+            "caras_points_%s.gpkg" % datetime.now().strftime("%Y%m%d_%H%M%S"),
+            "GeoPackage (*.gpkg);;ESRI Shapefile (*.shp)")
+        if not path:
+            return
+        driver = "ESRI Shapefile" if path.lower().endswith(".shp") else "GPKG"
+        on_map_grid = (res.config.method == "stratified"
+                       and res.config.strata_source == "map")
+        grid = res.classified_info if on_map_grid else res.reference_info
+        layer = QgsVectorLayer("Point?crs=%s" % grid.crs.authid(),
+                               "CARAS validation points", "memory")
+        provider = layer.dataProvider()
+        fields = [_make_field("unit_id", "int"), _make_field("x", "double"),
+                  _make_field("y", "double"), _make_field("ref_value", "double"),
+                  _make_field("map_value", "double")]
+        categorical = res.accuracy is not None
+        has_strata = res.sample.strata is not None
+        if categorical:
+            fields += [_make_field("ref_cat", "int"),
+                       _make_field("map_cat", "int"),
+                       _make_field("ref_label", "string"),
+                       _make_field("map_label", "string"),
+                       _make_field("agreement", "string")]
+            if has_strata:
+                fields.append(_make_field("stratum", "string"))
+        else:
+            fields.append(_make_field("residual", "double"))
+        provider.addAttributes(fields)
+        layer.updateFields()
+
+        labels = res.config.category_labels or {}
+        feats = []
+        for i in range(len(res.sample)):
+            f = QgsFeature()
+            f.setGeometry(QgsGeometry.fromPointXY(
+                QgsPointXY(float(res.sample.xs[i]), float(res.sample.ys[i]))))
+            attrs = [i + 1, float(res.sample.xs[i]), float(res.sample.ys[i]),
+                     _safe_float(res.reference_values[i]),
+                     _safe_float(res.classified_values[i])]
+            if categorical:
+                rc = res.reference_categories[i]
+                mc = res.classified_categories[i]
+                rc_i = int(rc) if np.isfinite(rc) else None
+                mc_i = int(mc) if np.isfinite(mc) else None
+                attrs += [rc_i, mc_i, labels.get(rc_i, ""),
+                          labels.get(mc_i, ""),
+                          ("agree" if (rc_i is not None and rc_i == mc_i)
+                           else "disagree")]
+                if has_strata:
+                    attrs.append(str(res.sample.strata[i]))
             else:
-                with open(file_path, 'w', encoding='utf-8') as f:
-                    f.write(self.result_text.toPlainText())
-                    
-            QMessageBox.information(self, "Başarılı / Success", 
-                f"Rapor başarıyla kaydedildi!\n"
-                f"Report saved successfully!\n\n{file_path}")
-                
-        except Exception as e:
-            QMessageBox.critical(self, "Hata / Error", 
-                f"Rapor kaydedilirken hata oluştu / Error saving report:\n{str(e)}")
-                
-    def generate_html_report(self):
-        """HTML raporu oluştur"""
-        results = self.validation_results
-        
-        html = f"""
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <title>CARAS — Classification Accuracy and Regression Assessment Suite</title>
-    <style>
-        body {{ 
-            font-family: 'Segoe UI', Arial, sans-serif; 
-            margin: 40px; 
-            background: #f5f5f5;
-        }}
-        .container {{
-            max-width: 1200px;
-            margin: 0 auto;
-            background: white;
-            padding: 30px;
-            border-radius: 10px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-        }}
-        h1 {{ 
-            color: #2c3e50; 
-            border-bottom: 4px solid #3498db; 
-            padding-bottom: 10px;
-        }}
-        .subtitle {{
-            color: #7f8c8d;
-            font-size: 0.95em;
-            margin-top: -10px;
-            margin-bottom: 20px;
-        }}
-        h2 {{ 
-            color: #34495e; 
-            margin-top: 30px;
-            border-left: 5px solid #3498db;
-            padding-left: 15px;
-        }}
-        .metric {{ 
-            background: #ecf0f1; 
-            padding: 15px; 
-            margin: 15px 0; 
-            border-radius: 8px;
-            border-left: 5px solid #3498db;
-        }}
-        .metric-value {{
-            font-size: 1.3em;
-            font-weight: bold;
-            color: #2c3e50;
-        }}
-        table {{ 
-            border-collapse: collapse; 
-            width: 100%; 
-            margin: 20px 0;
-            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
-        }}
-        th, td {{ 
-            border: 1px solid #ddd; 
-            padding: 12px; 
-            text-align: center; 
-        }}
-        th {{ 
-            background-color: #3498db; 
-            color: white;
-            font-weight: bold;
-        }}
-        tr:nth-child(even) {{ background-color: #f9f9f9; }}
-        tr:hover {{ background-color: #f5f5f5; }}
-        .footer {{
-            margin-top: 40px;
-            padding-top: 20px;
-            border-top: 2px solid #ecf0f1;
-            color: #7f8c8d;
-            font-size: 0.9em;
-        }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>🌍 CARAS Report</h1>
-        <p class="subtitle">Classification Accuracy and Regression Assessment Suite</p>
-        <p><strong>Analysis Date:</strong> {results['timestamp']}</p>
-        
-        <h2>📊 Primary Metrics / Temel Metrikler</h2>
-        <div class="metric">
-            <p><strong>Overall Accuracy (OA):</strong> 
-            <span class="metric-value">{results['overall_accuracy']:.4f} ({results['overall_accuracy']*100:.2f}%)</span></p>
-        </div>
-        <div class="metric">
-            <p><strong>Cohen's Kappa (κ):</strong> 
-            <span class="metric-value">{results['kappa']:.4f}</span></p>
-        </div>
-        <div class="metric">
-            <p><strong>F1-Score (Macro):</strong> 
-            <span class="metric-value">{results['f1_macro']:.4f}</span></p>
-            <p><strong>F1-Score (Weighted):</strong> 
-            <span class="metric-value">{results['f1_weighted']:.4f}</span></p>
-        </div>
-        <div class="metric">
-            <p><strong>Precision (Macro):</strong> {results['precision_macro']:.4f}</p>
-            <p><strong>Recall (Macro):</strong> {results['recall_macro']:.4f}</p>
-        </div>
-        
-        <h2>📐 Regression Statistics / Regresyon İstatistikleri</h2>
-        <div class="metric">
-            <p><em>Ham Piksel Değerleri / Raw Pixel Values</em></p>
-            <p><strong>R² (Determination Coeff.):</strong> <span class="metric-value">{results['r2']:.4f}</span></p>
-            <p><strong>RMSE (Root Mean Sq. Error):</strong> <span class="metric-value">{results['rmse']:.4f}</span></p>
-            <p><strong>MAE (Mean Absolute Error):</strong> <span class="metric-value">{results['mae']:.4f}</span></p>
-            <p><strong>Bias (Mean Error):</strong> <span class="metric-value">{results['bias']:.4f}</span>
-            {"&nbsp;⬆ Overestimation" if results['bias'] > 0 else "&nbsp;⬇ Underestimation" if results['bias'] < 0 else "&nbsp;✓ No Bias"}</p>
-        </div>
-        <div class="metric">
-            <p><em>Kategori Değerleri / Category Values</em></p>
-            <p><strong>R²:</strong> <span class="metric-value">{results['r2_cat']:.4f}</span></p>
-            <p><strong>RMSE:</strong> <span class="metric-value">{results['rmse_cat']:.4f}</span></p>
-            <p><strong>MAE:</strong> <span class="metric-value">{results['mae_cat']:.4f}</span></p>
-            <p><strong>Bias:</strong> <span class="metric-value">{results['bias_cat']:.4f}</span>
-            {"&nbsp;⬆ Overestimation" if results['bias_cat'] > 0 else "&nbsp;⬇ Underestimation" if results['bias_cat'] < 0 else "&nbsp;✓ No Bias"}</p>
-        </div>
-        
-        <h2>📋 Confusion Matrix / Karmaşıklık Matrisi</h2>
-        <table>
-            <tr>
-                <th>Reference \\ Predicted</th>
-"""
-        
-        class_names = results['class_names']
-        cm = np.array(results['confusion_matrix'])
-        
-        for name in class_names:
-            html += f"<th>{name}</th>"
-        html += "</tr>\n"
-        
-        for i, row in enumerate(cm):
-            html += f"<tr><th>{class_names[i]}</th>"
-            for val in row:
-                html += f"<td>{val}</td>"
-            html += "</tr>\n"
-                
-        html += """
-        </table>
-        
-        <h2>💡 Quality Assessment / Kalite Değerlendirmesi</h2>
-        <p>Detailed analysis results are available in the complete report.</p>
-        
-        <div class="footer">
-            <p>Generated by <strong>CARAS — Classification Accuracy and Regression Assessment Suite</strong></p>
-            <p>QGIS Plugin | Author: Ömer K. ÖRÜCÜ</p>
-        </div>
-    </div>
-</body>
-</html>
-"""
-        
-        return html
+                rv = _safe_float(res.reference_values[i])
+                mv = _safe_float(res.classified_values[i])
+                attrs.append(None if (rv is None or mv is None) else mv - rv)
+            f.setAttributes(attrs)
+            feats.append(f)
+        provider.addFeatures(feats)
+
+        options = QgsVectorFileWriter.SaveVectorOptions()
+        options.driverName = driver
+        options.fileEncoding = "UTF-8"
+        try:
+            err = QgsVectorFileWriter.writeAsVectorFormatV3(
+                layer, path, QgsCoordinateTransformContext(), options)
+        except AttributeError:
+            err = QgsVectorFileWriter.writeAsVectorFormatV2(
+                layer, path, QgsCoordinateTransformContext(), options)
+        if err[0] != QgsVectorFileWriter.WriterError.NoError:
+            QMessageBox.critical(self, PLUGIN_NAME,
+                                 "The points could not be written:\n%s"
+                                 % err[1])
+            return
+        saved = QgsVectorLayer(path, "CARAS validation points", "ogr")
+        if saved.isValid():
+            QgsProject.instance().addMapLayer(saved)
+        QMessageBox.information(self, PLUGIN_NAME, "Saved:\n%s" % path)
 
 
-class CARASPlugin:
-    """CARAS QGIS Plugin Sınıfı"""
+# ---------------------------------------------------------------------------
+# small helpers
+# ---------------------------------------------------------------------------
+def _bold_item(text, left=False):
+    item = QTableWidgetItem(text)
+    _bold(item)
+    item.setTextAlignment(
+        (Qt.AlignmentFlag.AlignLeft if left else Qt.AlignmentFlag.AlignRight)
+        | Qt.AlignmentFlag.AlignVCenter)
+    return item
+
+
+def _n(value, nd=4):
+    if value is None:
+        return "n/a"
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if not np.isfinite(v):
+        return "n/a"
+    return ("%." + str(nd) + "f") % v
+
+
+def _pctd(value):
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return "n/a"
+    if not np.isfinite(v):
+        return "n/a"
+    return "%.2f %%" % (100.0 * v)
+
+
+def _interval(estimate, z):
+    """Confidence interval, falling back to Wilson where Wald is unusable.
+
+    A class whose sample units are all correct yields a Wald standard error of
+    exactly zero, i.e. the interval [1, 1]; the Wilson score interval is
+    substituted there and marked with an asterisk.
+    """
+    if estimate.normal_approximation_ok is False:
+        wlo, whi = estimate.wilson(z)
+        if np.isfinite(wlo):
+            return "[%.4f, %.4f] *" % (wlo, whi)
+    lo, hi = estimate.ci(z)
+    if not np.isfinite(lo):
+        return "n/a"
+    return "[%.4f, %.4f]" % (lo, hi)
+
+
+def _safe_float(value):
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return v if np.isfinite(v) else None
+
+
+def _read_points_csv(path):
+    """Read ``id,x,y,reference_value``; extra columns are ignored."""
+    ids, xs, ys, vals = [], [], [], []
+    with open(path, "r", encoding="utf-8-sig") as fh:
+        header = fh.readline().strip()
+        sep = ";" if header.count(";") > header.count(",") else ","
+        cols = [c.strip().lower() for c in header.split(sep)]
+        try:
+            i_id, i_x, i_y = cols.index("id"), cols.index("x"), cols.index("y")
+        except ValueError:
+            raise ValueError("The CSV header must contain the columns id, x, y "
+                             "and (optionally) reference_value.")
+        i_v = cols.index("reference_value") if "reference_value" in cols else None
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            parts = [p.strip() for p in line.split(sep)]
+            if len(parts) <= max(i_id, i_x, i_y):
+                continue
+            try:
+                x = float(parts[i_x])
+                y = float(parts[i_y])
+            except ValueError:
+                continue
+            ids.append(parts[i_id])
+            xs.append(x)
+            ys.append(y)
+            if i_v is not None and len(parts) > i_v:
+                try:
+                    vals.append(float(parts[i_v]))
+                except ValueError:
+                    vals.append(float("nan"))
+            else:
+                vals.append(float("nan"))
+    if i_v is None or all(not np.isfinite(v) for v in vals):
+        vals = None
+    return ids, xs, ys, vals
+
+
+def _log(message):
+    try:
+        from qgis.core import Qgis, QgsMessageLog
+        QgsMessageLog.logMessage(message, PLUGIN_NAME,
+                                 Qgis.MessageLevel.Warning)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# plugin entry point
+# ---------------------------------------------------------------------------
+class CARASPlugin(object):
+
     def __init__(self, iface):
         self.iface = iface
-        self.dialog = None
         self.action = None
-        
+        self.dialog = None
+
     def initGui(self):
-        """Plugin GUI'sini başlat"""
         icon_path = os.path.join(os.path.dirname(__file__), "icon.png")
-        self.action = QAction(QIcon(icon_path), "CARAS — Accuracy & Regression Assessment", self.iface.mainWindow())
-        self.action.setToolTip("CARAS — Classification Accuracy and Regression Assessment Suite")
+        icon = QIcon(icon_path) if os.path.exists(icon_path) else QIcon()
+        self.action = QAction(icon, "CARAS - accuracy assessment",
+                              self.iface.mainWindow())
+        self.action.setToolTip(
+            "CARAS: design-based accuracy, area and agreement assessment "
+            "between two rasters")
         self.action.triggered.connect(self.run)
-        self.iface.addPluginToMenu("&CARAS", self.action)
         self.iface.addToolBarIcon(self.action)
-        
+        self.iface.addPluginToRasterMenu("CARAS", self.action)
+
     def unload(self):
-        """Plugin'i kaldır"""
-        self.iface.removePluginMenu("&CARAS", self.action)
-        self.iface.removeToolBarIcon(self.action)
-        
+        if self.action is not None:
+            self.iface.removeToolBarIcon(self.action)
+            self.iface.removePluginRasterMenu("CARAS", self.action)
+            self.action = None
+        self.dialog = None
+
     def run(self):
-        """Plugin'i çalıştır"""
         if self.dialog is None:
-            self.dialog = CARASDialog()
-        
-        self.dialog.load_raster_layers(self.dialog.reference_combo)
-        self.dialog.load_raster_layers(self.dialog.classified_combo)
-        
+            self.dialog = CARASDialog(self.iface, self.iface.mainWindow())
+        self.dialog.reload_layers()
         self.dialog.show()
         self.dialog.raise_()
         self.dialog.activateWindow()
 
 
 def classFactory(iface):
-    """QGIS plugin factory"""
     return CARASPlugin(iface)

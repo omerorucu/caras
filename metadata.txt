@@ -1,90 +1,101 @@
-# This file contains metadata for the QGIS plugin.
-# Required fields: name, description, version, qgisMinimumVersion, author, email, about, tracker, repository
+# CARAS - QGIS plugin metadata
+# Required fields: name, description, version, qgisMinimumVersion, author,
+#                  email, about, tracker, repository
 
 [general]
 
-# Plugin name (shown in Plugin Manager)
 name=CARAS - Classification Accuracy and Regression Assessment Suite
 
-# Short description (one line, shown in Plugin Manager list)
-description=Performs classification accuracy and regression assessment between two raster maps
+description=Design-based accuracy assessment, bias-adjusted area estimation and continuous-map agreement between two rasters, with confidence intervals
 
-# Detailed description (shown in plugin details)
-about=	This plugin was developed with the assistance of DeepSeek AI and Claude AI (Anthropic).
+about=CARAS performs a statistically defensible validation of one raster map
+    against another. It implements the accuracy-assessment good practices of
+    Olofsson et al. (2014, Remote Sensing of Environment 148:42-57):
+    design-based estimation under simple random, systematic (random start) or
+    stratified random sampling of pixels, with a fixed seed so that every
+    sample is reproducible; stratum weights taken from a full raster census, so
+    that a stratified sample is reweighted back to the map proportions instead
+    of over-representing rare classes; a standard error and confidence interval
+    for every estimate (overall, user's and producer's accuracy, F1, class
+    areas); bias-adjusted areas with confidence intervals, which pixel counting
+    cannot provide; quantity, allocation, exchange and shift disagreement
+    components (Pontius & Millones 2011; Pontius & Santacruz 2014) as the
+    recommended replacement for Cohen's kappa, which is still reported but
+    explicitly cautioned against; a sample size planner (Olofsson et al. 2014,
+    Eq. 13) with proportional, Neyman, equal and rare-class-floor allocation.
+    For continuous maps it reports RMSE with its systematic / unsystematic
+    split, MAE, bias, the coefficient of determination separately from squared
+    Pearson r, Willmott's d and d1, Lin's concordance correlation, an OLS slope
+    and intercept tested against 1 and 0, and seeded bootstrap confidence
+    intervals. A class-mapping interface folds two rasters with unrelated
+    legends onto shared categories. Pre-flight diagnostics cover CRS, extent
+    overlap, grid offset, resolution mismatch and undeclared NoData; a
+    mixed-CRS pair is transformed rather than silently mis-sampled. TXT, JSON,
+    HTML and CSV reports carry the complete provenance (seed, software
+    versions, raster metadata, census, class mapping) plus a ready-to-adapt
+    methods paragraph. The statistical core has no QGIS dependency and ships
+    with a test suite that verifies the published variance formulas, the
+    analytic identities of the disagreement decomposition and a hand-worked
+    stratified example. Requires only NumPy, which QGIS already provides.
+    Licensed under the GNU General Public License v3 or later.
 
-	CARAS (Classification Accuracy and Regression Assessment Suite) is a general-purpose
-    QGIS plugin for performing comprehensive validation analysis between two raster maps
-    (e.g. classified vs. reference). It supports multiple sampling methods (random,
-    stratified, systematic, CSV import), flexible class mapping, and computes a
-    comprehensive set of accuracy metrics including:
-    Overall Accuracy, Cohen's Kappa, F1-Score (macro & weighted), Precision, Recall,
-    Producer's & User's Accuracy per class, Confusion Matrix, R², RMSE, MAE, and Bias.
-    Results can be exported as TXT, JSON, or HTML reports. Compatible with QGIS 3.x and 4.0.
-
-    Desteklenen özellikler / Supported features:
-    - Rastgele, katmanlı ve sistematik örnekleme
-    - CSV dosyasından nokta yükleme
-    - Sınıf eşleştirme arayüzü
-    - Kapsamlı doğrulama metrikleri (OA, Kappa, F1, R², RMSE, MAE, Bias)
-    - TXT, JSON ve HTML rapor çıktısı
-    - Nokta katmanı olarak dışa aktarım (Shapefile)
-
-# Plugin version
-version=1.0.0
-
-# Minimum QGIS version required
-qgisMinimumVersion=3.0
-
-# Maximum QGIS version (leave empty for no upper limit)
+version=2.0.0
+qgisMinimumVersion=3.16
 qgisMaximumVersion=4.99
 
-# Author name
-author=Ömer K. ÖRÜCÜ
-
-# Author email
+author=Omer K. ORUCU
 email=omerorucu@sdu.edu.tr
 
-# Plugin homepage URL
 homepage=https://github.com/omerorucu/caras
-
-# Bug tracker / issue URL
 tracker=https://github.com/omerorucu/caras/issues
-
-# Source code repository URL
 repository=https://github.com/omerorucu/caras
 
-# Tags for Plugin Manager search (comma-separated)
-tags=raster, accuracy assessment, validation, kappa, confusion matrix, classification, remote sensing, regression, RMSE, R2, MAE, bias, CARAS, doğrulama, uzaktan algılama
+tags=raster,accuracy assessment,validation,confusion matrix,error matrix,area estimation,land cover,remote sensing,stratified sampling,confidence interval,quantity disagreement,allocation disagreement,RMSE,bias,agreement,CARAS
 
-# Category in Plugin Manager
 category=Raster
-
-# Icon file path (relative to plugin folder)
 icon=icon.png
-
-# Whether the plugin is experimental
 experimental=False
-
-# Whether the plugin is deprecated
 deprecated=False
-
-# Plugin changelog
-changelog=
-    1.0.0 - Initial release
-          - Random, stratified and systematic sampling
-          - CSV point import with reference values
-          - Class mapping dialog
-          - Metrics: OA, Kappa, F1, Precision, Recall, Confusion Matrix
-          - Regression statistics: R², RMSE, MAE, Bias (raw pixel & category values)
-          - Export to TXT, JSON, HTML and Shapefile
-          - QGIS 3.x and 4.0 / PyQt6 compatible (exec(), ItemFlag, AlignmentFlag,
-            ResizeMode, DialogCode, writeAsVectorFormatV3, QgsCoordinateTransformContext)
-          - Vectorized raster reading for large rasters, stratified sampling excludes NoData
-
-# Python dependencies (comma-separated)
-# These must be installed in the QGIS Python environment
-# install with: pip install scikit-learn numpy
 hasProcessingProvider=no
-
-# Server (set to True if the plugin provides a server interface)
 server=False
+
+changelog=
+    2.0.0 - Scientific rebuild. Results are not comparable with 1.0.0.
+      * Design-based estimation (Olofsson et al. 2014, Eqs. 4-10): a stratified
+        sample is reweighted by stratum weights taken from a full raster
+        census. Version 1 used raw sample counts, which biased every estimate
+        under a stratified design.
+      * Standard errors and confidence intervals for overall, user's and
+        producer's accuracy, F1 and area; Wilson intervals where the normal
+        approximation is unreliable.
+      * Bias-adjusted area estimation with confidence intervals.
+      * Quantity / allocation / exchange / shift disagreement components.
+        Cohen's kappa is retained, but the Landis & Koch verbal scale, which
+        has no basis in map accuracy assessment, has been removed.
+      * Regression statistics are no longer computed on nominal class codes; a
+        categorical / continuous mode switch enforces this.
+      * A CRS mismatch between the two rasters is detected and handled by a
+        coordinate transform instead of producing silently wrong pixel values;
+        resolution mismatch, grid offset and partial overlap are reported.
+      * Sampling is uniform over pixels rather than over coordinates (no
+        latitude bias in a geographic CRS), without replacement (no
+        pseudo-replication), restricted to the common valid area, and seeded.
+        Systematic sampling gained a random start and reports its realised
+        size instead of silently substituting floor(sqrt(n))^2 units.
+      * Stratified allocation: proportional, Neyman, equal, or proportional
+        with a floor for rare classes. Interactive sample size planner added.
+      * Optional minimum separation distance, with an explicit warning that it
+        alters the inclusion probabilities of the design.
+      * Streaming raster access: memory is bounded by the block size rather
+        than by the raster, and scattered point reads are O(n) instead of
+        O(pixels).
+      * The hard-coded -9999 NoData assumption was removed; only the declared
+        NoData value is honoured.
+      * scikit-learn is no longer required; NumPy alone is enough.
+      * Reports rewritten with full provenance, a limitations section, a
+        methods paragraph and references; the HTML export escapes user text and
+        no longer contains a placeholder section. New CSV matrix export and
+        GeoPackage point export.
+      * Added a GPL-3.0 licence file, CITATION.cff and a test suite of 37
+        checks that runs without QGIS.
+    1.0.0 - Initial release.
